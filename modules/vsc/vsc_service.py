@@ -1654,10 +1654,10 @@ class VSCService:
                             # Reconstruct everything after the first comma
                             suffix = "," + ",".join(parts[1:])
                         
-                        # Construct absolute path with forward slashes
-                        abs_path = os.path.abspath(os.path.join(self.proj_dir, "camFile_VSC", f"vsc_cam{cam_idx}.txt"))
-                        abs_path = abs_path.replace(os.sep, '/')
-                        new_line = f"{abs_path}{suffix}\n"
+                        # Write project-relative camera path for portability
+                        rel_path = os.path.join("camFile_VSC", f"vsc_cam{cam_idx}.txt")
+                        rel_path = rel_path.replace(os.sep, '/')
+                        new_line = f"{rel_path}{suffix}\n"
                         new_lines.append(new_line)
                         continue
             
