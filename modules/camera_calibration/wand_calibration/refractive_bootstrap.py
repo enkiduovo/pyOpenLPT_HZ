@@ -20,143 +20,551 @@ import numpy as np
 from scipy.optimize import least_squares
 import cv2
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
+import json
 import re
 
 
-def select_best_pair_via_precalib(base_calibrator, wand_len_mm: float, initial_focal_px: float) -> Optional[Tuple[int, int]]:
+# =========================================================================
+# P0 Failure Reason Constants (machine-readable)
+# =========================================================================
+P0_REASON_OK = "ok"
+P0_REASON_INSUFFICIENT_GEOMETRY = "insufficient_geometry"
+P0_REASON_ESSENTIAL_MATRIX_FAILED = "essential_matrix_failed"
+P0_REASON_TOO_FEW_E_INLIERS = "too_few_e_inliers"
+P0_REASON_UNSTABLE_SCALE_RECOVERY = "unstable_scale_recovery"
+P0_REASON_CATASTROPHIC_REPROJECTION = "catastrophic_reprojection"
+P0_REASON_PHASE1_BA_FAILURE = "phase1_ba_failure"
+
+
+@dataclass
+class P0Telemetry:
+    """Structured P0 diagnostics for debugging and downstream classification."""
+    selected_pair: Optional[Tuple[int, int]] = None
+    baseline_mm: Optional[float] = None
+
+    # Essential matrix stage
+    e_inliers: Optional[int] = None
+    e_total: Optional[int] = None
+
+    # Pose recovery stage
+    pose_inliers: Optional[int] = None
+    pose_total: Optional[int] = None
+    cheirality_ratio: Optional[float] = None
+
+    # Triangulation / scale stage
+    valid_inlier_wand_pairs: Optional[int] = None
+    median_triangulation_length: Optional[float] = None
+    scale_factor: Optional[float] = None
+    scale_factor_finite: Optional[bool] = None
+
+    # BA stage
+    ba_initial_cost: Optional[float] = None
+    ba_final_cost: Optional[float] = None
+    ba_converged: Optional[bool] = None
+    ba_message: Optional[str] = None
+
+    # Post-validation
+    reproj_err_mean: Optional[float] = None
+    reproj_err_max: Optional[float] = None
+    wand_length_median: Optional[float] = None
+    wand_length_error: Optional[float] = None
+    valid_frames: Optional[int] = None
+
+    # Failure tracking
+    failure_reason: str = P0_REASON_OK
+    failure_detail: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-friendly dict."""
+        d = {}
+        for k, v in asdict(self).items():
+            if isinstance(v, (np.floating, np.integer)):
+                d[k] = float(v)
+            elif isinstance(v, np.ndarray):
+                d[k] = v.tolist()
+            elif isinstance(v, tuple):
+                d[k] = list(v)
+            else:
+                d[k] = v
+        return d
+
+    def emit(self):
+        """Print a structured [P0_TELEMETRY] line for machine parsing."""
+        print(f"\n[P0_TELEMETRY] {json.dumps(self.to_dict(), default=str)}")
+
+
+class P0FailureError(RuntimeError):
+    """P0 failure with structured reason and telemetry."""
+    def __init__(self, message: str, reason: str, telemetry: 'P0Telemetry'):
+        telemetry.failure_reason = reason
+        telemetry.failure_detail = message
+        self.reason = reason
+        self.telemetry = telemetry
+        super().__init__(message)
+
+
+def _compute_pair_disparity(pair, points) -> float:
+    """Median pixel disparity for a camera pair across shared frames.
+
+    Higher disparity correlates with larger baseline separation and is
+    used as a cheap geometry-quality proxy that does not require 3-D
+    reconstruction.
     """
-    Run pinhole precalibration to determine the best camera pair based on
-    reprojection errors. Useful baseline even for refractive setups.
-    
-    Args:
-        base_calibrator: WandCalibrator instance
-        wand_len_mm: Target wand length in mm
-        initial_focal_px: Initial focal length in pixels
-        
+    c1, c2 = pair
+
+    def _extract_uv(pts):
+        if pts is None:
+            return None
+        arr = np.asarray(pts)
+        if arr.ndim == 1 and arr.shape[0] >= 2:
+            return np.array(arr[:2], dtype=np.float64)
+        if arr.ndim >= 2 and arr.shape[0] >= 1 and arr.shape[1] >= 2:
+            n = min(2, arr.shape[0])
+            return np.mean(arr[:n, :2].astype(np.float64), axis=0)
+        return None
+
+    d: List[float] = []
+    for _, cams in points.items():
+        if c1 not in cams or c2 not in cams:
+            continue
+        uv1 = _extract_uv(cams[c1])
+        uv2 = _extract_uv(cams[c2])
+        if uv1 is None or uv2 is None:
+            continue
+        disp = np.linalg.norm(uv1 - uv2)
+        if np.isfinite(disp):
+            d.append(float(disp))
+    if not d:
+        return -1.0
+    return float(np.median(d))
+
+
+# Minimum median pixel disparity to consider a pair as having adequate
+# geometry.  Used as a fallback when precalib camera positions are
+# unavailable.  Degenerate pairs have disparity < 1 px, healthy > 20 px.
+_MIN_GEOMETRY_DISPARITY_PX = 5.0
+
+# Minimum 3D baseline (mm) between camera centres from precalibration.
+#   degenerate baselines: 0.32 mm (case_023), 0.94 mm (case_028), 1.17 mm (case_012)
+#   healthy baselines:    241-2024 mm
+_MIN_GEOMETRY_BASELINE_MM = 10.0
+
+
+def _camera_center(R, T) -> Optional[np.ndarray]:
+    """Compute camera centre C = -R^T @ T.  Returns 3-element array or None."""
+    try:
+        T_col = np.asarray(T, dtype=np.float64).reshape(3, 1)
+        R_arr = np.asarray(R, dtype=np.float64)
+        C = -R_arr.T @ T_col
+        if np.all(np.isfinite(C)):
+            return C.flatten()
+    except Exception:
+        pass
+    return None
+
+
+def _extract_camera_centers(calibrator, cam_ids) -> Dict[int, np.ndarray]:
+    """Extract camera centres from whatever the calibrator provides.
+
+    Tries these sources in order (first success wins per camera):
+      1. ``calibrator.cameras[cid]``  — WandCalibrator after ``_parse_results``
+      2. ``calibrator.final_params[cid]``  — WandCalibrator alternate structure
+
+    Returns ``{cid: centre_3}`` for every camera whose position could be
+    determined.
+    """
+    centers: Dict[int, np.ndarray] = {}
+
+    # --- Source 1: calibrator.cameras ---
+    cameras = getattr(calibrator, 'cameras', None)
+    if cameras and isinstance(cameras, dict):
+        for cid in cam_ids:
+            if cid in centers:
+                continue
+            cam = cameras.get(cid)
+            if cam is None or not isinstance(cam, dict):
+                continue
+            R = cam.get('R')
+            T = cam.get('T')
+            if R is not None and T is not None:
+                c = _camera_center(R, T)
+                if c is not None:
+                    centers[cid] = c
+
+    # --- Source 2: calibrator.final_params ---
+    final_params = getattr(calibrator, 'final_params', None)
+    if final_params and isinstance(final_params, dict):
+        for cid in cam_ids:
+            if cid in centers:
+                continue
+            fp = final_params.get(cid)
+            if fp is None or not isinstance(fp, dict):
+                continue
+            R = fp.get('R')
+            T = fp.get('T')
+            if R is not None and T is not None:
+                c = _camera_center(R, T)
+                if c is not None:
+                    centers[cid] = c
+
+    return centers
+
+
+def _compute_pairwise_essential_baseline(
+    pair, calibrator, wand_len_mm: float, focal_px: float,
+) -> float:
+    """Pairwise baseline (mm) via Essential Matrix for a single camera pair.
+
+    Mirrors the P0 bootstrap's own 8-point decomposition: for cameras
+    looking through refractive media the *pairwise* Essential Matrix may
+    be degenerate even when global camera positions are well-separated.
+    Returns -1.0 on failure.
+    """
+    c1, c2 = pair
+    wand_data = (
+        getattr(calibrator, 'wand_points_filtered', None)
+        or getattr(calibrator, 'wand_points', None)
+        or {}
+    )
+    if not wand_data:
+        return -1.0
+
+    cam_settings = getattr(calibrator, 'camera_settings', None) or {}
+    image_size = getattr(calibrator, 'image_size', None) or (800, 1280)
+
+    def _get_K(cid):
+        cs = cam_settings.get(cid)
+        if cs:
+            f = float(cs.get('focal', 0) or 0)
+            w = int(cs.get('width', 0) or 0)
+            h = int(cs.get('height', 0) or 0)
+            if f > 0 and w > 0 and h > 0:
+                return np.array([[f, 0, w / 2.0], [0, f, h / 2.0], [0, 0, 1.0]])
+        h_def, w_def = image_size
+        return np.array([
+            [focal_px, 0, w_def / 2.0],
+            [0, focal_px, h_def / 2.0],
+            [0, 0, 1.0],
+        ])
+
+    pts1, pts2 = [], []
+    for fid in sorted(wand_data):
+        obs = wand_data[fid]
+        if c1 in obs and c2 in obs:
+            p1, p2 = obs[c1], obs[c2]
+            pts1.append(np.asarray(p1[0][:2], dtype=np.float64))
+            pts1.append(np.asarray(p1[1][:2], dtype=np.float64))
+            pts2.append(np.asarray(p2[0][:2], dtype=np.float64))
+            pts2.append(np.asarray(p2[1][:2], dtype=np.float64))
+    pts1 = np.array(pts1, dtype=np.float64) if pts1 else np.empty((0, 2))
+    pts2 = np.array(pts2, dtype=np.float64) if pts2 else np.empty((0, 2))
+    if len(pts1) < 8:
+        return -1.0
+
+    try:
+        K1 = _get_K(c1)
+        K2 = _get_K(c2)
+        pts1_n = cv2.undistortPoints(pts1.reshape(-1, 1, 2), K1, None).reshape(-1, 2)
+        pts2_n = cv2.undistortPoints(pts2.reshape(-1, 1, 2), K2, None).reshape(-1, 2)
+
+        E, _ = cv2.findEssentialMat(
+            pts1_n, pts2_n, focal=1.0, pp=(0.0, 0.0),
+            method=cv2.RANSAC, prob=0.999, threshold=1e-3,
+        )
+        if E is None or E.shape != (3, 3):
+            return -1.0
+
+        _, R_rel, t_rel, _ = cv2.recoverPose(
+            E, pts1_n, pts2_n, focal=1.0, pp=(0.0, 0.0),
+        )
+
+        P1_norm = np.hstack((np.eye(3), np.zeros((3, 1))))
+        P2_norm = np.hstack((R_rel, t_rel))
+        pts4d = cv2.triangulatePoints(P1_norm, P2_norm, pts1_n.T, pts2_n.T)
+        pts3d_raw = (pts4d[:3] / pts4d[3]).T
+
+        dists = np.array([
+            np.linalg.norm(pts3d_raw[i] - pts3d_raw[i + 1])
+            for i in range(0, len(pts3d_raw), 2)
+        ])
+        valid = dists[(dists > 1e-3) & (dists < 1e3)]
+        if len(valid) < 5:
+            return -1.0
+        scale = wand_len_mm / float(np.median(valid))
+        t_scaled = t_rel * scale
+
+        baseline = float(np.linalg.norm(t_scaled))
+        return baseline if np.isfinite(baseline) else -1.0
+    except Exception:
+        return -1.0
+
+
+def _compute_precalib_baseline(pair, calibrator, camera_centers=None) -> float:
+    """3D baseline (mm) between two camera centres using precalib R/T.
+
+    Camera centre: ``C = -R^T @ T``.  Returns -1.0 if unavailable.
+
+    Parameters
+    ----------
+    pair : tuple of int
+        Camera IDs.
+    calibrator : object
+        Calibrator instance (used only when *camera_centers* is None).
+    camera_centers : dict, optional
+        Pre-extracted ``{cid: centre_3}`` dict.  When supplied, the
+        calibrator is not queried — this avoids repeated attribute
+        look-ups and supports calibrators that don't expose extrinsics.
+    """
+    c1, c2 = pair
+
+    # Fast path: pre-extracted centres
+    if camera_centers is not None:
+        C1 = camera_centers.get(c1)
+        C2 = camera_centers.get(c2)
+        if C1 is not None and C2 is not None:
+            dist = float(np.linalg.norm(np.asarray(C1) - np.asarray(C2)))
+            return dist if np.isfinite(dist) else -1.0
+        return -1.0
+
+    # Legacy path: read directly from calibrator (WandCalibrator compat)
+    cameras = getattr(calibrator, 'cameras', None)
+    if not cameras:
+        return -1.0
+    cam1 = cameras.get(c1)
+    cam2 = cameras.get(c2)
+    if cam1 is None or cam2 is None:
+        return -1.0
+    R1 = cam1.get('R')
+    T1 = cam1.get('T')
+    R2 = cam2.get('R')
+    T2 = cam2.get('T')
+    if R1 is None or T1 is None or R2 is None or T2 is None:
+        return -1.0
+    C1 = _camera_center(R1, T1)
+    C2 = _camera_center(R2, T2)
+    if C1 is None or C2 is None:
+        return -1.0
+    dist = float(np.linalg.norm(C1 - C2))
+    return dist if np.isfinite(dist) else -1.0
+
+
+def select_ranked_pairs_via_precalib(
+    base_calibrator,
+    wand_len_mm: float,
+    initial_focal_px: float,
+) -> Optional[List[Tuple[int, int]]]:
+    """
+    Return camera pairs ranked by combined reprojection quality and
+    geometry quality (pixel disparity as baseline proxy).
+
+    Pairs with low disparity (nearly co-located cameras) are demoted
+    regardless of per-camera reprojection error, which prevents the
+    pathological case where two cameras with the lowest individual error
+    happen to be nearly co-located.
+
     Returns:
-        (cam_i, cam_j) tuple of best camera pair, or None if failed
+        Ranked list of (cam_i, cam_j) pairs (best first), or None on failure.
     """
     print("\n[BOOT] Running Precalibration Check to select best pair...")
-    
+
+    points = (
+        getattr(base_calibrator, 'wand_points_filtered', None)
+        or getattr(base_calibrator, 'wand_points', {})
+    )
+
     try:
         if not hasattr(base_calibrator, 'run_precalibration_check'):
             raise AttributeError("run_precalibration_check is unavailable on base calibrator")
         ret, msg, precalib_result = base_calibrator.run_precalibration_check(
             wand_length=wand_len_mm,
-            init_focal_length=initial_focal_px
+            init_focal_length=initial_focal_px,
         )
     except Exception as e:
         print(f"  [WARN] Precalibration failed: {e}. Falling back to shared count.")
-        
-        # Fallback: Select pair with most common frames
-        counts = {}
-        points = getattr(base_calibrator, 'wand_points_filtered', None) or getattr(base_calibrator, 'wand_points', {})
-        if not points:
-             return None
-        
-        all_cams = set()
-        for fid, cams in points.items():
-            cam_list = list(cams.keys())
-            for i in range(len(cam_list)):
-                for j in range(i+1, len(cam_list)):
-                    c1, c2 = sorted((cam_list[i], cam_list[j]))
-                    counts[(c1, c2)] = counts.get((c1, c2), 0) + 1
-                    all_cams.add(c1)
-                    all_cams.add(c2)
-        
-        if not counts:
-             # Just pick first two cams
-             cams = sorted(list(all_cams))
-             if len(cams) >= 2:
-                 return (cams[0], cams[1])
-             return None
-
-        # Sort by shared count desc; tie-break by median pixel disparity (larger is better).
-        sorted_pairs = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-
-        def _extract_uv(pts):
-            if pts is None:
-                return None
-            arr = np.asarray(pts)
-            if arr.ndim == 1 and arr.shape[0] >= 2:
-                return np.array(arr[:2], dtype=np.float64)
-            if arr.ndim >= 2 and arr.shape[0] >= 1 and arr.shape[1] >= 2:
-                # Use centroid of first two detected points (small/large) when available.
-                n = min(2, arr.shape[0])
-                return np.mean(arr[:n, :2].astype(np.float64), axis=0)
-            return None
-
-        def _pair_disparity(pair):
-            c1, c2 = pair
-            d = []
-            for _, cams in points.items():
-                if c1 not in cams or c2 not in cams:
-                    continue
-                uv1 = _extract_uv(cams[c1])
-                uv2 = _extract_uv(cams[c2])
-                if uv1 is None or uv2 is None:
-                    continue
-                disp = np.linalg.norm(uv1 - uv2)
-                if np.isfinite(disp):
-                    d.append(float(disp))
-            if not d:
-                return -1.0
-            return float(np.median(d))
-
-        top_count = sorted_pairs[0][1]
-        top_pairs = [p for p, cnt in sorted_pairs if cnt == top_count]
-        best_pair = max(top_pairs, key=_pair_disparity)
-        print(
-            f"[BOOT] Fallback: Selected pair {best_pair} with {top_count} shared frames "
-            f"(median disparity={_pair_disparity(best_pair):.2f}px)."
-        )
-        return best_pair
+        return _ranked_pairs_fallback(points)
 
     if not ret:
         print(f"  [WARN] Precalibration returned False: {msg}")
-        # Try to parse errors anyway
-        pass
 
-    # Extract errors
     wand_data = base_calibrator.wand_points_filtered or base_calibrator.wand_points
     all_cam_ids = sorted(list(set(cid for f in wand_data.values() for cid in f)))
-    
-    per_cam_error = {}
-    # Try to get from internal state first
+
+    per_cam_error: Dict[int, float] = {}
     if hasattr(base_calibrator, 'per_frame_errors') and base_calibrator.per_frame_errors:
-        cam_errors_list = {cid: [] for cid in all_cam_ids}
+        cam_errors_list: Dict[int, List[float]] = {cid: [] for cid in all_cam_ids}
         for fid, frame_data in base_calibrator.per_frame_errors.items():
             if 'cam_errors' in frame_data:
                 for cid, err in frame_data['cam_errors'].items():
-                    if cid in cam_errors_list: 
+                    if cid in cam_errors_list:
                         cam_errors_list[cid].append(err)
         for cid in all_cam_ids:
             if cam_errors_list[cid]:
                 per_cam_error[cid] = np.sqrt(np.mean(np.array(cam_errors_list[cid])**2))
-    
-    # Fallback to parsing message
+
     if not per_cam_error:
         for line in msg.split('\n'):
             match = re.search(r'Cam\s*(\d+):\s*([\d.]+)\s*px', line)
             if match:
                 per_cam_error[int(match.group(1))] = float(match.group(2))
-    
+
     if not per_cam_error:
         print("  [WARN] Could not determine per-camera errors.")
         return None
-        
+
     print("\n[BOOT] Per-camera reprojection errors (Pinhole approx):")
     for cid in sorted(per_cam_error.keys()):
         print(f"  Cam {cid}: {per_cam_error[cid]:.2f}px")
-        
-    sorted_cams = sorted(per_cam_error.keys(), key=lambda c: per_cam_error[c])
-    if len(sorted_cams) < 2:
+
+    cam_ids = sorted(per_cam_error.keys())
+    if len(cam_ids) < 2:
         return None
-        
-    best_pair = (min(sorted_cams[0], sorted_cams[1]), max(sorted_cams[0], sorted_cams[1]))
-    print(f"[BOOT] Selected best pair: {best_pair}")
-    return best_pair
+
+    # --- Extract camera centres for 3D baseline checks ---
+    camera_centers = _extract_camera_centers(base_calibrator, cam_ids)
+    if camera_centers:
+        print(f"  [BOOT] Camera centres available for {len(camera_centers)}/{len(cam_ids)} cameras (precalib)")
+    else:
+        print("  [BOOT] Calibrator did not expose extrinsics; pairwise Essential Matrix fallback may be used")
+
+    candidate_pairs: List[Tuple[int, int]] = []
+    for i in range(len(cam_ids)):
+        for j in range(i + 1, len(cam_ids)):
+            candidate_pairs.append((cam_ids[i], cam_ids[j]))
+
+    if not candidate_pairs:
+        return None
+
+    essential_baseline_cache: Dict[Tuple[int, int], float] = {}
+    pair_metrics: Dict[Tuple[int, int], dict] = {}
+
+    max_err = max(per_cam_error.values(), default=1.0)
+    if max_err <= 0:
+        max_err = 1.0
+
+    def _pair_score(pair):
+        if pair in pair_metrics:
+            return pair_metrics[pair]["score"]
+
+        c1, c2 = pair
+        reproj_avg = (per_cam_error[c1] + per_cam_error[c2]) / 2.0
+        reproj_norm = reproj_avg / max_err
+
+        baseline_3d = _compute_precalib_baseline(pair, base_calibrator, camera_centers=camera_centers)
+        baseline_source = "precalib"
+        disparity = _compute_pair_disparity(pair, points)
+
+        if baseline_3d < 0:
+            if pair not in essential_baseline_cache:
+                essential_baseline_cache[pair] = _compute_pairwise_essential_baseline(
+                    pair, base_calibrator, wand_len_mm, initial_focal_px,
+                )
+            baseline_3d = essential_baseline_cache[pair]
+            baseline_source = "essential"
+
+        if baseline_3d >= 0:
+            geometry_ok = baseline_3d >= _MIN_GEOMETRY_BASELINE_MM
+        else:
+            geometry_ok = disparity >= _MIN_GEOMETRY_DISPARITY_PX
+            baseline_source = "disparity"
+
+        penalty = 0.0 if geometry_ok else 1000.0
+        score = penalty + reproj_norm
+        pair_metrics[pair] = {
+            "score": score,
+            "reproj_avg": reproj_avg,
+            "baseline_3d": baseline_3d,
+            "baseline_source": baseline_source,
+            "disparity": disparity,
+            "geometry_ok": geometry_ok,
+        }
+        return score
+
+    ranked = sorted(candidate_pairs, key=_pair_score)
+
+    if not any(pair_metrics[pair]["geometry_ok"] for pair in ranked):
+        print("[BOOT] No geometry-valid camera pair found; aborting pair selection.")
+        return None
+
+    print("\n[BOOT] Pair ranking (geometry-aware):")
+    for idx, pair in enumerate(ranked[:5]):
+        metrics = pair_metrics[pair]
+        bl = metrics["baseline_3d"]
+        disp = metrics["disparity"]
+        reproj = metrics["reproj_avg"]
+        source = metrics["baseline_source"]
+        invalid = " [geometry-invalid]" if not metrics["geometry_ok"] else ""
+        tag = " <-- selected" if idx == 0 else ""
+        print(
+            f"  #{idx+1} {pair}: reproj_avg={reproj:.2f}px, baseline_3d={bl:.1f}mm, "
+            f"disparity={disp:.1f}px, source={source}{invalid}{tag}"
+        )
+
+    print(f"[BOOT] Selected best pair: {ranked[0]}")
+    return ranked
+
+
+def _ranked_pairs_fallback(points) -> Optional[List[Tuple[int, int]]]:
+    """Fallback ranking when precalibration is unavailable.
+
+    Uses shared-frame count and median pixel disparity (same signals as
+    the original fallback path, but returns a ranked list).
+    """
+    if not points:
+        return None
+
+    counts: Dict[Tuple[int, int], int] = {}
+    all_cams: set = set()
+    for fid, cams in points.items():
+        cam_list = list(cams.keys())
+        for i in range(len(cam_list)):
+            for j in range(i + 1, len(cam_list)):
+                c1, c2 = sorted((cam_list[i], cam_list[j]))
+                counts[(c1, c2)] = counts.get((c1, c2), 0) + 1
+                all_cams.add(c1)
+                all_cams.add(c2)
+
+    if not counts:
+        cams_sorted = sorted(list(all_cams))
+        if len(cams_sorted) >= 2:
+            return [(cams_sorted[0], cams_sorted[1])]
+        return None
+
+    def _fallback_score(item):
+        pair, cnt = item
+        disparity = _compute_pair_disparity(pair, points)
+        geometry_ok = disparity >= _MIN_GEOMETRY_DISPARITY_PX
+        penalty = 0.0 if geometry_ok else 1000.0
+        return (-cnt + penalty, -disparity)
+
+    ranked = [p for p, _ in sorted(counts.items(), key=_fallback_score)]
+
+    if ranked:
+        top = ranked[0]
+        disp = _compute_pair_disparity(top, points)
+        cnt = counts[top]
+        print(
+            f"[BOOT] Fallback: Selected pair {top} with {cnt} shared frames "
+            f"(median disparity={disp:.2f}px)."
+        )
+    return ranked if ranked else None
+
+
+def select_best_pair_via_precalib(
+    base_calibrator,
+    wand_len_mm: float,
+    initial_focal_px: float,
+) -> Optional[Tuple[int, int]]:
+    """
+    Backward-compatible wrapper: returns the single best pair from the
+    geometry-aware ranked list.
+    """
+    ranked = select_ranked_pairs_via_precalib(
+        base_calibrator, wand_len_mm, initial_focal_px,
+    )
+    if ranked and len(ranked) > 0:
+        return ranked[0]
+    return None
 
 
 @dataclass
@@ -221,6 +629,8 @@ class PinholeBootstrapP0:
             params_j: [rvec(3), tvec(3)] for cam_j (from 8-Point + refinement)
             report: diagnostics dict
         """
+        telemetry = P0Telemetry(selected_pair=(cam_i, cam_j))
+
         K_i, f_i, cx_i, cy_i = self._get_camera_intrinsics(cam_i, camera_settings)
         K_j, f_j, cx_j, cy_j = self._get_camera_intrinsics(cam_j, camera_settings)
         
@@ -235,16 +645,19 @@ class PinholeBootstrapP0:
             except:
                 pass
         
-        # Collect valid frames and points
         valid_frames = self._collect_valid_frames(observations, cam_i, cam_j)
+        telemetry.valid_frames = len(valid_frames)
         print(f"  Valid frames: {len(valid_frames)}")
         
         if len(valid_frames) < 10:
-            raise ValueError(f"[P0] Insufficient frames: {len(valid_frames)} < 10")
+            raise P0FailureError(
+                f"[P0 FAIL] Insufficient frames: {len(valid_frames)} < 10",
+                P0_REASON_INSUFFICIENT_GEOMETRY,
+                telemetry,
+            )
         
-        # Collect point correspondences for 8-Point Algorithm
-        pts_i = []  # Points in cam_i
-        pts_j = []  # Points in cam_j
+        pts_i = []
+        pts_j = []
         
         for fid in valid_frames:
             uvA_i, uvB_i = observations[fid][cam_i]
@@ -265,7 +678,6 @@ class PinholeBootstrapP0:
             except:
                 pass
 
-        # Step 1: Essential Matrix (normalized rays, supports different intrinsics)
         pts_i_norm = cv2.undistortPoints(pts_i.reshape(-1, 1, 2), K_i, None).reshape(-1, 2)
         pts_j_norm = cv2.undistortPoints(pts_j.reshape(-1, 1, 2), K_j, None).reshape(-1, 2)
         E, mask = cv2.findEssentialMat(
@@ -278,24 +690,39 @@ class PinholeBootstrapP0:
             threshold=1e-3,
         )
         
+        telemetry.e_total = len(pts_i)
+
         if E is None or E.shape != (3, 3):
-            raise RuntimeError("[P0 FAIL] Essential Matrix computation failed")
+            telemetry.e_inliers = 0
+            raise P0FailureError(
+                "[P0 FAIL] Essential Matrix computation failed",
+                P0_REASON_ESSENTIAL_MATRIX_FAILED,
+                telemetry,
+            )
         
-        # Step 2: Recover Pose (R, t)
         inlier_idx = np.where(mask.ravel() > 0)[0]
         n_E_inliers = len(inlier_idx)
+        telemetry.e_inliers = n_E_inliers
 
         if n_E_inliers < 8:
-            raise RuntimeError(f"[P0 FAIL] Too few Essential inliers: {n_E_inliers}")
+            raise P0FailureError(
+                f"[P0 FAIL] Too few Essential inliers: {n_E_inliers}",
+                P0_REASON_TOO_FEW_E_INLIERS,
+                telemetry,
+            )
 
         n_inliers, R_rel, t_rel, mask_pose = cv2.recoverPose(
             E, pts_i_norm[inlier_idx], pts_j_norm[inlier_idx], focal=1.0, pp=(0.0, 0.0)
         )
 
+        telemetry.pose_inliers = int(n_inliers)
+        telemetry.pose_total = n_E_inliers
+        telemetry.cheirality_ratio = float(n_inliers) / max(1, n_E_inliers)
+
         print(f"  E-Matrix Inliers: {n_E_inliers} / {len(pts_i)}")
         print(f"  Pose Inliers: {n_inliers} / {n_E_inliers}")
+        print(f"  Cheirality ratio: {telemetry.cheirality_ratio:.3f}")
         
-        # Step 3: Triangulate to compute scale
         print(f"\n[P0] Step 2: Triangulation & Scale Recovery...")
         if progress_callback:
             try:
@@ -303,22 +730,18 @@ class PinholeBootstrapP0:
             except:
                 pass
         
-        # Projection matrices (cam_i at origin)
         P_i = np.hstack([np.eye(3), np.zeros((3, 1))])
         P_j = np.hstack([R_rel, t_rel])
         
-        # Triangulate inlier correspondences for robust scale anchor
         pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_norm[inlier_idx].T, pts_j_norm[inlier_idx].T)
         pts_3d_inlier = (pts_4d_hom[:3] / pts_4d_hom[3]).T
 
         pose_inlier_idx_local = np.where(mask_pose.ravel() > 0)[0]
         pose_inlier_idx_global = inlier_idx[pose_inlier_idx_local]
 
-        # Keep full point set for downstream optimization state
         pts_4d_hom_all = cv2.triangulatePoints(P_i, P_j, pts_i_norm.T, pts_j_norm.T)
         pts_3d = (pts_4d_hom_all[:3] / pts_4d_hom_all[3]).T
 
-        # Compute wand lengths using inlier-anchored frame pairs
         wand_lengths_inlier = []
         for i_frame in range(0, len(pts_3d) - 1, 2):
             if i_frame in inlier_idx and (i_frame + 1) in inlier_idx:
@@ -328,8 +751,14 @@ class PinholeBootstrapP0:
                 ptB = pts_3d_inlier[idx_B_in_inliers]
                 wand_lengths_inlier.append(np.linalg.norm(ptB - ptA))
 
+        telemetry.valid_inlier_wand_pairs = len(wand_lengths_inlier)
+
         if len(wand_lengths_inlier) < 5:
-            raise RuntimeError("[P0 FAIL] Triangulation failed to produce valid inlier wand pairs")
+            raise P0FailureError(
+                f"[P0 FAIL] Triangulation produced only {len(wand_lengths_inlier)} inlier wand pairs (need >= 5)",
+                P0_REASON_UNSTABLE_SCALE_RECOVERY,
+                telemetry,
+            )
 
         wand_lengths_inlier = np.array(wand_lengths_inlier)
         valid_lengths_inlier = wand_lengths_inlier[(wand_lengths_inlier > 0.001) & (wand_lengths_inlier < 1000)]
@@ -343,20 +772,37 @@ class PinholeBootstrapP0:
             wand_lengths = np.array(wand_lengths)
             valid_lengths = wand_lengths[(wand_lengths > 0.001) & (wand_lengths < 1000)]
             print(f"  [WARN] Insufficient inlier pairs ({len(valid_lengths_inlier)}); using all correspondences for scale.")
+            if len(valid_lengths) == 0:
+                raise P0FailureError(
+                    "[P0 FAIL] No valid triangulation lengths for scale recovery",
+                    P0_REASON_UNSTABLE_SCALE_RECOVERY,
+                    telemetry,
+                )
             median_length = np.median(valid_lengths)
         else:
             median_length = np.median(valid_lengths_inlier)
             print(f"  Scale anchor: {len(valid_lengths_inlier)} valid inlier wand pairs, median={median_length:.4f} mm")
+
+        telemetry.median_triangulation_length = float(median_length)
+
         scale_factor = self.config.wand_length_mm / median_length
+        telemetry.scale_factor = float(scale_factor)
+        telemetry.scale_factor_finite = bool(np.isfinite(scale_factor))
+
+        if not np.isfinite(scale_factor) or scale_factor <= 0:
+            raise P0FailureError(
+                f"[P0 FAIL] Scale factor is invalid: {scale_factor}",
+                P0_REASON_UNSTABLE_SCALE_RECOVERY,
+                telemetry,
+            )
+
+        print(f"  Scale factor: {scale_factor:.6f} (finite={telemetry.scale_factor_finite})")
         
-        # Apply scale to translation
         t_scaled = t_rel * scale_factor
         
-        # Convert R to rvec
         rvec_j, _ = cv2.Rodrigues(R_rel)
         
-        # Build params arrays (both cameras, matching production Phase 1)
-        params_i = np.zeros(6)  # cam_i at origin initially
+        params_i = np.zeros(6)
         params_j = np.concatenate([rvec_j.flatten(), t_scaled.flatten()])
         
         print(f"\n[P0] Step 3: Extrinsic Refinement (frozen intrinsics)...")
@@ -366,23 +812,18 @@ class PinholeBootstrapP0:
             except:
                 pass
         
-        # Build initial 3D points (scaled)
         pts_3d_scaled = pts_3d * scale_factor
         n_pts = len(pts_3d_scaled)
         
-        # UNANCHORED BA (matching production): both cam_i and cam_j are free
-        # After convergence, results are re-expressed in cam_i's frame (post-processing anchoring)
-        # State vector: [cam_i(6), cam_j(6), pts_3d(N*3)]
         x0 = np.concatenate([params_i, params_j, pts_3d_scaled.flatten()])
         
         from scipy.sparse import lil_matrix
         
-        # Residuals: for each frame: wand(1) + reproj(8) = 9
         n_frames = len(valid_frames)
         n_res = n_frames * 9
         n_cams = 2
         n_cam_params = 6
-        pt_start = n_cams * n_cam_params  # = 12
+        pt_start = n_cams * n_cam_params
         n_params = pt_start + n_pts * 3
         
         A_sparsity = lil_matrix((n_res, n_params), dtype=int)
@@ -392,24 +833,22 @@ class PinholeBootstrapP0:
             idx_ptB = pt_start + i * 6 + 3
             base_res = i * 9
             
-            # Wand length
             A_sparsity[base_res, idx_ptA:idx_ptA+3] = 1
             A_sparsity[base_res, idx_ptB:idx_ptB+3] = 1
             
-            # Reproj cam_i ptA/ptB
             A_sparsity[base_res+1:base_res+3, 0:6] = 1
             A_sparsity[base_res+1:base_res+3, idx_ptA:idx_ptA+3] = 1
             A_sparsity[base_res+3:base_res+5, 0:6] = 1
             A_sparsity[base_res+3:base_res+5, idx_ptB:idx_ptB+3] = 1
             
-            # Reproj cam_j ptA/ptB
             A_sparsity[base_res+5:base_res+7, 6:12] = 1
             A_sparsity[base_res+5:base_res+7, idx_ptA:idx_ptA+3] = 1
             A_sparsity[base_res+7:base_res+9, 6:12] = 1
             A_sparsity[base_res+7:base_res+9, idx_ptB:idx_ptB+3] = 1
         
-        # Residuals function (frozen intrinsics, both cameras free)
         self._res_call_count = 0 
+        initial_cost_captured = [None]
+
         def residuals_func(x):
             p_i = x[:6]
             p_j = x[6:12]
@@ -432,14 +871,12 @@ class PinholeBootstrapP0:
                 ptA = pts[idx * 2]
                 ptB = pts[idx * 2 + 1]
                 
-                # Wand length
                 wand_len = np.linalg.norm(ptB - ptA)
                 d_len = wand_len - self.config.wand_length_mm
                 res.append(d_len)
                 sq_err_len += d_len * d_len
                 n_len += 1
                 
-                # Reprojections with frozen K
                 proj_Ai = self._project(ptA, R_i, t_i, K_i)
                 proj_Bi = self._project(ptB, R_i, t_i, K_i)
                 diff_Ai = (proj_Ai - uvA_i)
@@ -458,11 +895,12 @@ class PinholeBootstrapP0:
                 sq_err_proj += float(np.sum(diff_Aj**2) + np.sum(diff_Bj**2))
                 n_proj += 4
 
-            # To numpy
             res_arr = np.array(res)
 
-            # Report progress with metrics
             self._res_call_count += 1
+            if initial_cost_captured[0] is None:
+                initial_cost_captured[0] = float(0.5 * np.sum(res_arr**2))
+
             if progress_callback and self._res_call_count % 5 == 0:
                 try:
                     rmse_len = np.sqrt(sq_err_len / max(1, n_len))
@@ -495,53 +933,56 @@ class PinholeBootstrapP0:
             max_nfev=100,
         )
 
+        telemetry.ba_initial_cost = initial_cost_captured[0]
+        telemetry.ba_final_cost = float(result.cost)
+        telemetry.ba_converged = bool(result.success)
+        telemetry.ba_message = str(result.message)
+
         if not result.success and result.cost > 1e8:
-            raise RuntimeError(
+            raise P0FailureError(
                 f"[P0 FAIL] Phase 1 BA failed to converge: cost={result.cost:.2e}, "
-                f"message='{result.message}'"
+                f"message='{result.message}'",
+                P0_REASON_PHASE1_BA_FAILURE,
+                telemetry,
             )
 
-        # Extract raw BA results (both cameras free)
         params_i_raw = result.x[:6]
         params_j_raw = result.x[6:12]
         pts_3d_raw = result.x[12:].reshape(-1, 3)
 
-        # Post-processing anchoring: re-express all results in cam_i's frame
-        # so that cam_i ends up at identity (origin)
-        # Convention: X_cam = R @ X_world + t
         R_i_raw, _ = cv2.Rodrigues(params_i_raw[:3])
         t_i_raw = params_i_raw[3:6].reshape(3, 1)
         R_j_raw, _ = cv2.Rodrigues(params_j_raw[:3])
         t_j_raw = params_j_raw[3:6].reshape(3, 1)
 
-        # Transform 3D points into cam_i's frame
         pts_3d_opt = (R_i_raw @ pts_3d_raw.T + t_i_raw).T
 
-        # Transform cam_j into cam_i's frame:
-        #   R_j_anchored = R_j_raw @ R_i_raw^T
-        #   t_j_anchored = t_j_raw - R_j_anchored @ t_i_raw
         R_j_anchored = R_j_raw @ R_i_raw.T
         t_j_anchored = t_j_raw - R_j_anchored @ t_i_raw
         rvec_j_anchored, _ = cv2.Rodrigues(R_j_anchored)
 
-        params_i_opt = np.zeros(6)   # cam_i at identity (anchored)
+        params_i_opt = np.zeros(6)
         params_j_opt = np.concatenate([rvec_j_anchored.flatten(), t_j_anchored.flatten()])
 
         print(f"  [ANCHORING] Phase 1 BA: cam_{cam_i} fixed at origin (post-processing re-expression)")
         print(f"  cam_{cam_j} rvec: [{params_j_opt[0]:.4f}, {params_j_opt[1]:.4f}, {params_j_opt[2]:.4f}]")
         print(f"  cam_{cam_j} tvec: [{params_j_opt[3]:.2f}, {params_j_opt[4]:.2f}, {params_j_opt[5]:.2f}]")
-        print(f"  BA cost: {result.cost:.2e}")
+        print(f"  BA cost: initial={telemetry.ba_initial_cost:.2e}, final={result.cost:.2e}")
         
-        # Compute diagnostics
         report = self._compute_diagnostics(
             cam_i, cam_j, params_i_opt, params_j_opt,
             observations, valid_frames, K_i, K_j
         )
         report['scale_factor'] = scale_factor
         report['n_inliers'] = n_inliers
+
+        telemetry.baseline_mm = report['baseline_mm']
+        telemetry.reproj_err_mean = report['reproj_err_mean']
+        telemetry.reproj_err_max = report['reproj_err_max']
+        telemetry.wand_length_median = report['wand_length_median']
+        telemetry.wand_length_error = report['wand_length_error']
         
-        # Sanity checks
-        self._validate(report)
+        self._validate(report, telemetry)
         
         print(f"\n[P0] Phase 1 Complete:")
         print(f"  cam_{cam_i} rvec: [{params_i_opt[0]:.4f}, {params_i_opt[1]:.4f}, {params_i_opt[2]:.4f}]")
@@ -550,6 +991,10 @@ class PinholeBootstrapP0:
         print(f"  cam_{cam_j} tvec: [{params_j_opt[3]:.2f}, {params_j_opt[4]:.2f}, {params_j_opt[5]:.2f}]")
         print(f"  Baseline: {report['baseline_mm']:.2f} mm")
         print(f"  Wand length: {report['wand_length_median']:.4f} mm")
+
+        telemetry.emit()
+
+        report['p0_telemetry'] = telemetry.to_dict()
         
         return params_i_opt, params_j_opt, report
     
@@ -664,7 +1109,7 @@ class PinholeBootstrapP0:
             'valid_frames': len(valid_frames),
         }
     
-    def _validate(self, report: dict):
+    def _validate(self, report: dict, telemetry: P0Telemetry):
         """Validate P0 results. FAIL if constraints violated."""
         print(f"\n{'-'*60}")
         print("[P0 VALIDATION]")
@@ -678,7 +1123,11 @@ class PinholeBootstrapP0:
         reproj = report.get('reproj_err_mean', 0)
         print(f"  Reproj error mean: {reproj:.2f} px")
         if reproj > 50.0:
-            raise RuntimeError(f"[P0 FAIL] Reprojection error too high: {reproj:.2f} px")
+            raise P0FailureError(
+                f"[P0 FAIL] Reprojection error too high: {reproj:.2f} px",
+                P0_REASON_CATASTROPHIC_REPROJECTION,
+                telemetry,
+            )
         
         wand_err = report.get('wand_length_error', float('inf'))
         print(f"  Wand length error: {wand_err:.4f} mm")

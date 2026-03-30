@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>World Coordinate Alignment Guide</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #e0e0e0;
+            background-color: #1e1e1e;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #00bcd4;
+            border-bottom: 2px solid #00bcd4;
+            padding-bottom: 10px;
+        }
+
+        h2 {
+            color: #4dd0e1;
+            margin-top: 40px;
+            border-bottom: 1px solid #333;
+            padding-bottom: 5px;
+        }
+
+        h3 {
+            color: #80deea;
+            margin-top: 25px;
+        }
+
+        img {
+            max-width: 100%;
+            border: 1px solid #444;
+            border-radius: 5px;
+            margin: 20px 0;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+        }
+
+        .container {
+            background-color: #252526;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+
+        ul,
+        ol {
+            padding-left: 25px;
+        }
+
+        li {
+            margin-bottom: 8px;
+        }
+
+        strong {
+            color: #ffffff;
+        }
+
+        code {
+            background-color: #333;
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-family: Consolas, monospace;
+            color: #ff9800;
+        }
+
+        .step-block {
+            margin-bottom: 20px;
+            padding-left: 15px;
+            border-left: 3px solid #00bcd4;
+        }
+
+        .highlight {
+            background-color: #2d2d30;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #3e3e42;
+        }
+
+        .important {
+            color: #ff5252;
+            font-weight: bold;
+        }
+
+        a.back-link {
+            display: inline-block;
+            margin-bottom: 20px;
+            color: #00bcd4;
+            text-decoration: none;
+            font-weight: bold;
+        }
+
+        a.back-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <a href="../index.html" class="back-link">← Back to Home</a>
+        <h1>World Coordinate Alignment Guide</h1>
+        <p>This guide explains how to define a meaningful world coordinate system after camera
+            calibration in OpenLPT. By default, the optimizer produces an arbitrary coordinate frame.
+            If your experiment requires a specific orientation (e.g., <strong>+Z up</strong>,
+            <strong>+X streamwise</strong>), you can align the world frame using four reference
+            landmarks on a known calibration object.</p>
+
+        <div class="highlight">
+            <span class="important">How It Works:</span>
+            <p style="margin-top: 5px;">You identify four landmarks visible in at least two cameras:
+                <strong>Center</strong> (origin), <strong>+X</strong>, <strong>+Y</strong>, and
+                <strong>+Z</strong>. The software triangulates each landmark into 3D, computes
+                direction vectors from the center, and fits the closest right-handed orthonormal
+                basis via SVD. A rigid transform (rotation + translation) is then applied to all
+                cameras, 3D points, and refraction plates &mdash; without altering intrinsic
+                parameters or distortion coefficients.</p>
+        </div>
+
+        <div class="highlight" style="border-left: 3px solid #00e676;">
+            <span class="important" style="color: #00e676;">Best Practices:</span>
+            <ul style="margin-top: 5px;">
+                <li><strong>Use a rigid target</strong> &mdash; a physical frame, L-bracket, or
+                    calibration object with clearly marked axis directions. Freehand points are
+                    prone to noise.</li>
+                <li><strong>Separate the points</strong> &mdash; axis markers should be well-spaced
+                    (at least 5&ndash;10&times; the expected triangulation error) to produce a
+                    stable basis.</li>
+                <li><strong>Multi-camera visibility</strong> &mdash; each landmark must be visible
+                    in <strong>at least 2 cameras</strong>. More cameras improve accuracy.</li>
+                <li><strong>Keep the target stationary</strong> &mdash; do not move the axis object
+                    between the frames used for detection.</li>
+                <li><strong>State your convention</strong> &mdash; decide before alignment whether
+                    your experiment uses +Z up, +Y up, or another convention, and label your
+                    target accordingly.</li>
+            </ul>
+        </div>
+
+        <!-- Option A: Detect in the GUI -->
+        <h2>Option A: Detect Axis Points in the GUI</h2>
+        <p>Use the built-in detection and selection tools on the <strong>Point Detection</strong>
+            sub-tab of wand calibration.</p>
+
+        <div class="step-block">
+            <h3>Step 1: Switch to Custom Axis Mode</h3>
+            <p>In the <strong>Detection Settings</strong> panel, set the <strong>Axis direction</strong>
+                radio button to <strong>Custom</strong>. This reveals the axis camera table and
+                detection controls.</p>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 2: Load Axis Images</h3>
+            <p>In the axis camera table, click the first column button for each camera to load
+                one or more images of your axis target. These images should show all four reference
+                markers (center, +X, +Y, +Z) clearly visible.</p>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 3: Detect Circles</h3>
+            <p>Adjust the <strong>Radius Range</strong> and <strong>Sensitivity</strong> sliders
+                so that the detector can find all marker circles, then click the
+                <strong>Detect</strong> button. The system runs circle detection across all loaded
+                axis images.</p>
+            <ul>
+                <li>If fewer points are found than expected, widen the radius range or increase
+                    sensitivity.</li>
+                <li>Detected circles are overlaid on the image view for visual confirmation.</li>
+            </ul>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 4: Select Axis Directions</h3>
+            <p>For each camera, click the <strong>Select</strong> button in the axis camera table.
+                The image view enters selection mode and prompts you to click three points in
+                order:</p>
+            <ol>
+                <li>Click the detected circle corresponding to <strong>+X</strong>.</li>
+                <li>Click the detected circle corresponding to <strong>+Y</strong>.</li>
+                <li>Click the detected circle corresponding to <strong>+Z</strong>.</li>
+            </ol>
+            <p>The <strong>Center</strong> point is inferred automatically from the remaining
+                detected circle(s). Repeat for all cameras.</p>
+        </div>
+
+        <div class="step-block">
+            <h3>Step 5: Save Axis Data</h3>
+            <p>Click the <strong>Save</strong> button to store the axis direction data. You will
+                be prompted to save a CSV file. The data is also kept in memory for the current
+                session.</p>
+        </div>
+
+        <hr style="border-color: #444; margin: 40px 0;">
+
+        <!-- Option B: Load from CSV -->
+        <h2>Option B: Load Axis Points from CSV</h2>
+        <p>If you already have axis-point coordinates (e.g., from a previous session or manual
+            measurement), you can load them directly on the <strong>Calibration</strong> sub-tab.</p>
+
+        <div class="step-block">
+            <h3>Step 1: Prepare the CSV File</h3>
+         

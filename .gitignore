@@ -61,3 +61,7 @@ test/
 !.sisyphus/plans/**
 
 scripts/
+
+Paper/
+
+.opencode-agenthub

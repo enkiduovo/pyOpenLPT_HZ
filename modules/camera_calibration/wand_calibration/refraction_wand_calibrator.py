@@ -20,7 +20,15 @@ from .refractive_geometry import (
     update_cpp_camera_state
 )
 
-from .refractive_bootstrap import PinholeBootstrapP0, PinholeBootstrapP0Config, select_best_pair_via_precalib
+from .refractive_bootstrap import (
+    PinholeBootstrapP0,
+    PinholeBootstrapP0Config,
+    select_best_pair_via_precalib,
+    select_ranked_pairs_via_precalib,
+    P0FailureError,
+    P0Telemetry,
+    P0_REASON_INSUFFICIENT_GEOMETRY,
+)
 from .refraction_calibration_BA import RefractiveBAOptimizer, RefractiveBAConfig
 from scipy.optimize import least_squares
 
@@ -1934,11 +1942,16 @@ class RefractiveWandCalibrator:
                 if initial_focal < 100:
                      raise ValueError(f"CRITICAL: UI focal length {initial_focal} seems invalid.")
                 
-                # --- Pre-Step: Select Best Pair ---
-                best_pair = select_best_pair_via_precalib(self.base, wand_len_target, initial_focal)
+                # --- Pre-Step: Select Ranked Pairs (geometry-aware) ---
+                ranked_pairs = select_ranked_pairs_via_precalib(self.base, wand_len_target, initial_focal)
                 
-                if best_pair is None:
-                    raise ValueError("[BOOT] Could not select best pair")
+                if not ranked_pairs:
+                    raise P0FailureError(
+                        "[BOOT] No geometry-valid camera pair found during precalibration",
+                        P0_REASON_INSUFFICIENT_GEOMETRY,
+                        P0Telemetry(),
+                    )
+                best_pair = ranked_pairs[0]
                 print(f"[BOOT] Using reliable pair from precalib: {best_pair}") 
 
                 # Prepare observations for P0
@@ -1950,21 +1963,47 @@ class RefractiveWandCalibrator:
                 
                 all_cam_ids = dataset['cam_ids']
                 
-                # Run P0 (Phase 1 + Phase 2 + Phase 3)
+                # Run P0 (Phase 1 + Phase 2 + Phase 3) with one deterministic fallback retry
                 config = PinholeBootstrapP0Config(
                     wand_length_mm=wand_len_target,
                 )
                 bootstrap = PinholeBootstrapP0(config)
                 
                 cam_i, cam_j = best_pair
-                cam_params_p0, report = bootstrap.run_all(
-                    cam_i=cam_i,
-                    cam_j=cam_j,
-                    observations=observations,
-                    camera_settings=camera_settings,
-                    all_cam_ids=all_cam_ids,
-                    progress_callback=progress_callback
-                )
+                try:
+                    cam_params_p0, report = bootstrap.run_all(
+                        cam_i=cam_i,
+                        cam_j=cam_j,
+                        observations=observations,
+                        camera_settings=camera_settings,
+                        all_cam_ids=all_cam_ids,
+                        progress_callback=progress_callback
+                    )
+                except P0FailureError as p0e:
+                    p0e.telemetry.emit()
+                    print(f"[P0 FAIL] reason={p0e.reason}, detail={p0e.telemetry.failure_detail}")
+
+                    fallback_pair = ranked_pairs[1] if len(ranked_pairs) >= 2 else None
+                    if fallback_pair is None:
+                        print("[P0 FAIL] No fallback pair available. Giving up.")
+                        raise
+
+                    print(f"[P0 RETRY] Attempting one fallback pair: {fallback_pair}")
+                    cam_i, cam_j = fallback_pair
+                    try:
+                        cam_params_p0, report = bootstrap.run_all(
+                            cam_i=cam_i,
+                            cam_j=cam_j,
+                            observations=observations,
+                            camera_settings=camera_settings,
+                            all_cam_ids=all_cam_ids,
+                            progress_callback=progress_callback
+                        )
+                        best_pair = fallback_pair
+                    except P0FailureError as p0e2:
+                        p0e2.telemetry.emit()
+                        print(f"[P0 FAIL] Fallback pair also failed: reason={p0e2.reason}")
+                        raise
 
                 
                 # Convert P0 output to expected format: {cid: [rvec, tvec, f, cx, cy, k1, k2]}
