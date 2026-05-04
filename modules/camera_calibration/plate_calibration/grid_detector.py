@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from ..image_utils import load_image_any_depth, to_bgr_uint8, to_gray_uint8
+
 class GridDetector:
     def __init__(self):
         pass
@@ -23,12 +25,12 @@ class GridDetector:
         Returns:
             tuple: (keypoints, vis_img)
         """
-        img = cv2.imread(image_path)
+        img = load_image_any_depth(image_path)
         if img is None:
             raise ValueError(f"Could not load image: {image_path}")
 
         # 1. Preprocessing
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = to_gray_uint8(img)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         
@@ -56,7 +58,7 @@ class GridDetector:
             inferred_keypoints = GridDetector._fill_missing_points(keypoints, img, blob_color)
 
         # 5. Visualization Image
-        vis_img = img.copy()
+        vis_img = to_bgr_uint8(img)
         
         # Draw detected (Green)
         vis_img = cv2.drawKeypoints(vis_img, keypoints, np.array([]), (0, 255, 0), 
@@ -220,20 +222,12 @@ class GridDetector:
             center_offset (tuple): (dx, dy) offset of the dot center from the template geometric center (scale 1.0).
             search_mask (np.arrayType): Optional uint8 mask (255=ROI). Points outside are ignored.
         """
-        img = cv2.imread(image_path)
+        img = load_image_any_depth(image_path)
         if img is None:
             raise ValueError(f"Could not load image: {image_path}")
-            
-        # Convert to Gray
-        if len(img.shape) == 3:
-            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            img_gray = img
-            
-        if len(template.shape) == 3:
-            templ_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-        else:
-            templ_gray = template
+
+        img_gray = to_gray_uint8(img)
+        templ_gray = to_gray_uint8(template)
             
         w, h = templ_gray.shape[::-1]
         
@@ -330,7 +324,7 @@ class GridDetector:
             pass
             
         # 4. Visualization
-        vis_img = img.copy()
+        vis_img = to_bgr_uint8(img)
         
         # Custom Draw: Cross "+" with size = template width / 4 (Smaller as requested)
         marker_size = int(w / 4)

@@ -24,6 +24,8 @@ from .wand_calibration.refraction_wand_calibrator import RefractiveWandCalibrato
 from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QPainterPath
 from PySide6.QtCore import QRect, Signal, QPoint, QThread, QTimer, Slot, QObject, QEvent
 
+from .image_utils import load_image_any_depth, to_gray_uint8, to_rgb_uint8
+
 class ZoomableImageLabel(QLabel):
     """
     Label with zoom, pan, and multiple interaction modes.
@@ -2757,8 +2759,7 @@ class CameraCalibrationView(QWidget):
     def _capture_plate_image_size_hint(self, cam_idx: int, img_path) -> bool:
         """Capture image size hint for a camera from a plate image path."""
         try:
-            import cv2
-            img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+            img = load_image_any_depth(img_path)
             if img is None or len(img.shape) < 2:
                 return False
             h, w = int(img.shape[0]), int(img.shape[1])
@@ -2869,7 +2870,7 @@ class CameraCalibrationView(QWidget):
             
         img_path = self.plate_images[row]
         import cv2
-        img = cv2.imread(str(img_path))
+        img = load_image_any_depth(img_path)
         if img is None:
             return
             
@@ -2892,15 +2893,15 @@ class CameraCalibrationView(QWidget):
             patch = img[iy:iy+ih, ix:ix+iw]
             
             # 2. Auto-Center Logic
+            gray = None
             try:
-                gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                gray = to_gray_uint8(patch)
                 
                 # Threshold
                 # Use Otsu's thresholding
                 # Note: We don't strictly rely on is_dark for inv/norm here anymore, 
                 # we'll use a border check to ensure the 'dot' is the foreground.
-                gray_u8 = gray.astype(np.uint8)
-                _, binary = cv2.threshold(gray_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 
                 # Check borders to see if background is white (255)
                 # If background is white, findContours will treat it as object. We want dot as object.
@@ -2953,7 +2954,7 @@ class CameraCalibrationView(QWidget):
                     # Re-run contour on the FINAL patch to find exact centroid offset
                     # This handles the fact that integer shifting might still be 0.5px off
                     try:
-                        p_gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                        p_gray = to_gray_uint8(patch)
                         # Check border for auto-polarity
                         if (np.mean(p_gray[0,:]) + np.mean(p_gray[-1,:]) + np.mean(p_gray[:,0]) + np.mean(p_gray[:,-1]))/4 > 127:
                             p_bin = 255 - p_gray # Invert
@@ -2989,14 +2990,17 @@ class CameraCalibrationView(QWidget):
                     self.lbl_template_status.setText(f"{iw}x{ih} (raw)")
             except Exception as e:
                 print(f"Auto-center failed: {e}")
+                self.current_template = None
+                self.template_offset = (0.0, 0.0)
                 self.lbl_template_status.setText(f"{iw}x{ih}")
 
-            self.current_template = patch
+            if gray is not None:
+                self.current_template = gray
             self.lbl_template_status.setStyleSheet("color: #00ff00;")
             
             # Show Preview
             # Convert BGR to RGB
-            preview_img = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+            preview_img = to_rgb_uint8(patch)
             h, w, ch = preview_img.shape
             
             # Draw Crosshair on preview to show center
@@ -3420,24 +3424,12 @@ class CameraCalibrationView(QWidget):
         img_idx = max(0, min(img_idx, len(files) - 1))
         path = files[img_idx]
 
-        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        img = load_image_any_depth(path)
         if img is None:
             lbl.setText("Image Load Error")
             return
 
-        if len(img.shape) == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        elif img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-        else:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        if img.dtype != np.uint8:
-            max_val = float(img.max())
-            if max_val > 0:
-                img = (img / max_val * 255).astype(np.uint8)
-            else:
-                img = np.zeros_like(img, dtype=np.uint8)
+        img = to_rgb_uint8(img)
 
         self._draw_axis_overlay(cam_idx, img_idx, img)
 
@@ -3773,33 +3765,23 @@ class CameraCalibrationView(QWidget):
 
         # Robust loading with OpenCV
         import cv2
-        import numpy as np
         from PySide6.QtGui import QPixmap, QImage
         
         pixmap = QPixmap() # Default empty
-        img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+        img = load_image_any_depth(img_path)
         
         if img is not None:
-             # Save size hint before any conversion.
-             self.plate_image_size_hints[int(cam_idx)] = (int(img.shape[1]), int(img.shape[0]))
+            # Save size hint before any conversion.
+            self.plate_image_size_hints[int(cam_idx)] = (int(img.shape[1]), int(img.shape[0]))
 
-              # Convert to RGB for Qt
-             if len(img.shape) == 2:  # Grayscale
-                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-             elif img.shape[2] == 4:  # RGBA
-                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-             else:  # BGR
-                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-             
-             if img.dtype != np.uint8:
-                 img = (img / img.max() * 255).astype(np.uint8)
-                  
-             h, w, ch = img.shape
-             bytes_per_line = ch * w
-             q_img = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-             pixmap = QPixmap.fromImage(q_img)
+            img = to_rgb_uint8(img)
+
+            h, w, ch = img.shape
+            bytes_per_line = ch * w
+            q_img = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
         else:
-             pixmap = QPixmap(str(img_path))
+            pixmap = QPixmap(str(img_path))
         
         cam_idx = self.plate_cam_combo.currentIndex()
         target_label = self.plate_cam_labels.get(cam_idx, None)
@@ -4091,7 +4073,6 @@ class CameraCalibrationView(QWidget):
                 )
             
             # Convert to QPixmap for display
-            import cv2
             h, w, ch = vis_img.shape
             bytes_per_line = ch * w
             # OpenCV is BGR, Qt needs RGB
@@ -6806,8 +6787,7 @@ class CameraCalibrationView(QWidget):
             roi_mask = None
             if len(self.search_roi_points) == 4:
                 # Create mask same size as image
-                import cv2
-                img = cv2.imread(str(img_path))
+                img = load_image_any_depth(img_path)
                 if img is not None:
                     h, w = img.shape[:2]
                     roi_mask = np.zeros((h, w), dtype=np.uint8)
@@ -6824,7 +6804,6 @@ class CameraCalibrationView(QWidget):
             )
             
             # Convert to QPixmap for display
-            import cv2
             h, w, ch = vis_img.shape
             bytes_per_line = ch * w
             # OpenCV is BGR, Qt needs RGB
