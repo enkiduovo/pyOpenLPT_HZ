@@ -27,6 +27,7 @@ dependencies = [
     "numba>=0.60.0",
     "matplotlib>=3.7.0",
     "requests>=2.31.0",
+    "Pillow>=10.0.0",
     "pycine>=0.3.2",
     "pywin32>=306; sys_platform == 'win32'",
 ]
