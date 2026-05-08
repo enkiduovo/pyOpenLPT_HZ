@@ -1,0 +1,58 @@
+name: PR Tracking Regression
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tracking-regression:
+    name: tracking-regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libomp-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          sed -i 's/^opencv>=/opencv-python>=/' requirements.txt
+          grep -vE "cxx-compiler|llvm-openmp|cmake" requirements.txt > req_pip.txt
+          python -m pip install -r req_pip.txt
+          python -m pip install pybind11 setuptools wheel pytest
+
+      - name: Build and install OpenLPT
+        run: |
+          python -m pip install . -v --no-build-isolation
+
+      - name: Unit-check regression tooling
+        run: |
+          python -m pytest tests/test_regenerate_test_stb.py
+
+      - name: Run fixed test_STB tracking regression gate
+        run: |
+          python test/inputs/test_STB/run_pr_tracking_regression.py
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-stb-tracking-metrics
+          path: test/inputs/test_STB/e2e_metrics.json
+          if-no-files-found: ignore

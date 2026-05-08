@@ -1,0 +1,76 @@
+{
+  "manifest_path": "D:\\0.Code\\OpenLPTGUI\\OpenLPT\\test\\inputs\\test_STB\\manifest.csv",
+  "result_dir": "D:\\0.Code\\OpenLPTGUI\\OpenLPT\\test\\results\\test_STB\\ConvergeTrack",
+  "frame_end": 99,
+  "eval_frame_range": {
+    "start": 50,
+    "end": 99
+  },
+  "track_files": {
+    "D:\\0.Code\\OpenLPTGUI\\OpenLPT\\test\\results\\test_STB\\ConvergeTrack\\LongTrackActive_99.csv": {
+      "exists": true,
+      "rows": 1094244
+    },
+    "D:\\0.Code\\OpenLPTGUI\\OpenLPT\\test\\results\\test_STB\\ConvergeTrack\\LongTrackInactive_99.csv": {
+      "exists": true,
+      "rows": 766
+    },
+    "D:\\0.Code\\OpenLPTGUI\\OpenLPT\\test\\results\\test_STB\\ConvergeTrack\\ExitTrack_99.csv": {
+      "exists": true,
+      "rows": 103386
+    }
+  },
+  "metrics": [
+    {
+      "label": "all_manifest_points",
+      "threshold_mm": 0.1,
+      "gt_rows": 625000,
+      "gt_tracks": 12500,
+      "detected_rows": 606588,
+      "detected_tracks": 12145,
+      "matched_rows": 606588,
+      "correct_rows": 605199,
+      "coverage_C_track": 0.98096,
+      "covered_gt_tracks": 12262,
+      "position_error_mean_mm": 0.001201429926241189,
+      "position_error_median_mm": 0.000980076089405433,
+      "fragmentation_F_mean_detected_tracks_per_covered_gt": 1.0803294731691404,
+      "correct_connection_Cr_mean_per_detected_track": 0.9696647730605025,
+      "correct_connection_Cr_median_per_detected_track": 1.0
+    },
+    {
+      "label": "all_4_camera_visible_centers",
+      "threshold_mm": 0.1,
+      "gt_rows": 543528,
+      "gt_tracks": 11552,
+      "detected_rows": 606588,
+      "detected_tracks": 12145,
+      "matched_rows": 606588,
+      "correct_rows": 543296,
+      "coverage_C_track": 0.9975761772853186,
+      "covered_gt_tracks": 11524,
+      "position_error_mean_mm": 0.0010831542421918202,
+      "position_error_median_mm": 0.0009415980294385344,
+      "fragmentation_F_mean_detected_tracks_per_covered_gt": 1.0459909753557792,
+      "correct_connection_Cr_mean_per_detected_track": 0.8845349153190716,
+      "correct_connection_Cr_median_per_detected_track": 1.0
+    },
+    {
+      "label": "all_4_camera_rendered_roi",
+      "threshold_mm": 0.1,
+      "gt_rows": 546738,
+      "gt_tracks": 11600,
+      "detected_rows": 606588,
+      "detected_tracks": 12145,
+      "matched_rows": 606588,
+      "correct_rows": 546498,
+      "coverage_C_track": 0.9975862068965518,
+      "covered_gt_tracks": 11572,
+      "position_error_mean_mm": 0.001087721819013074,
+      "position_error_median_mm": 0.0009434084093487132,
+      "fragmentation_F_mean_detected_tracks_per_covered_gt": 1.047269270653301,
+      "correct_connection_Cr_mean_per_detected_track": 0.8890099982567147,
+      "correct_connection_Cr_median_per_detected_track": 1.0
+    }
+  ]
+}

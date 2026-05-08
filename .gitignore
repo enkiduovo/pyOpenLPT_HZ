@@ -46,12 +46,20 @@ opencode.jsonc
 # OpenCode directory
 .opencode/
 .opencode
+opencode.json
 
 tmp/
 
 build-tests
 
 test/
+!/test/
+!/test/inputs/
+!/test/inputs/test_STB/
+/test/inputs/test_STB/generated*/
+!/test/inputs/test_STB/regenerate_test_stb.py
+!/test/inputs/test_STB/evaluate_tracking_metrics.py
+!/test/inputs/test_STB/run_pr_tracking_regression.py
 
 # ignore everything
 .sisyphus/*
