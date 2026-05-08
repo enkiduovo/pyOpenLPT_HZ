@@ -331,7 +331,7 @@ Image ImageIO::loadImg (int img_id)
         break;
     }
 
-    _TIFFfree(buffer);
+    delete[] buffer;
     TIFFClose(tif);
 
     return image;
