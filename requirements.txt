@@ -13,3 +13,4 @@ cmake>=3.15
 cxx-compiler
 llvm-openmp
 requests>=2.31.0
+pycine>=0.3.2

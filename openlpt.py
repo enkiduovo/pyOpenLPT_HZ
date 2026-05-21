@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 """
 OpenLPT - Open-source Lagrangian Particle Tracking
 Unified entry point for API, CLI, and GUI.
@@ -68,6 +69,19 @@ def run_stb(config_file_path):
         print(f"OpenLPT Execution Error: {e}")
         sys.exit(1)
 
+
+def run_preprocess(argv):
+    """
+    Runs the image preprocessing CLI subcommand.
+    """
+    try:
+        from modules.image_preprocessing.cli import main as preprocess_main
+    except ImportError as e:
+        print(f"Error: Could not load image preprocessing CLI. {e}")
+        sys.exit(1)
+
+    sys.exit(preprocess_main(argv))
+
 def main():
     """
     Main CLI entry point for 'openlpt' command.
@@ -79,6 +93,8 @@ def main():
 Usage examples:
   openlpt --gui             # Launch the GUI (default)
   openlpt config.txt        # Run STB tracking using the specified config
+  openlpt preprocess ...    # Run image preprocessing CLI
+  openlpt preprocess --help # Show preprocessing CLI help
   openlpt-gui               # Alternative command for GUI
 """
     )
@@ -87,7 +103,11 @@ Usage examples:
     parser.add_argument("--gui", action="store_true", help="Launch the GUI.")
     parser.add_argument("-v", "--version", action="store_true", help="Show OpenLPT version.")
 
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if argv and argv[0] == "preprocess":
+        run_preprocess(argv[1:])
+
+    args = parser.parse_args(argv)
 
     if args.version:
         print(f"OpenLPT version {__version__}")
