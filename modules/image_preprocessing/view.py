@@ -6,6 +6,7 @@ Main view for the Image Preprocessing module with Camera Calibration style layou
 import numpy as np
 import cv2
 import os
+import shlex
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
@@ -14,12 +15,14 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QPushButton, QGroupBox, QGridLayout, QSlider, QSpinBox,
     QCheckBox, QComboBox, QFileDialog, QScrollArea, QApplication,
-    QLineEdit, QTableWidgetItem, QMessageBox, QDialog, QProgressBar
+    QLineEdit, QTableWidgetItem, QMessageBox, QDialog, QProgressBar,
+    QTextEdit
 )
 from PySide6.QtCore import Qt, Signal, QObject, QThread, Slot
 from PySide6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
 
 from .widgets import RangeSlider, ProcessingDialog
+from .core import imadjust_opencv, apply_processing_pipeline_with_settings
 
 try:
     from pycine.raw import read_frames as pycine_read_frames
@@ -29,84 +32,9 @@ except Exception as e:
     pycine = None
 
 
-def imadjust_opencv(img, low_in, high_in, low_out=0, high_out=255, gamma=1.0):
-    """
-    img: uint8 or float image
-    low_in, high_in, low_out, high_out: same scale as img
-    gamma: gamma correction
-    """
-    # Ensure float for calculation
-    img = img.astype(np.float32)
-
-    # normalize to [0,1]
-    # Handle division by zero
-    diff = high_in - low_in
-    if diff < 1e-5:
-        diff = 1e-5
-        
-    img = (img - low_in) / diff
-    img = np.clip(img, 0, 1)
-
-    # gamma
-    if gamma != 1.0:
-        img = img ** gamma
-
-    # scale to output range
-    img = img * (high_out - low_out) + low_out
-    img = np.clip(img, low_out, high_out)
-
-    return img.astype(np.uint8)
-
-
 def _apply_processing_pipeline_with_settings(img_data, bg_data, cam_idx, settings):
-    """Pure processing pipeline for worker thread use."""
-    # 0. Ensure grayscale and float32
-    if len(img_data.shape) == 3:
-        gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    else:
-        gray = img_data.astype(np.float32)
-
-    # 1. Background Subtraction (float32)
-    if settings["bg_enabled"] and bg_data is not None:
-        if settings["invert"]:
-            result = bg_data - gray
-        else:
-            result = gray - bg_data
-        result = np.clip(result, 0, None)
-    else:
-        result = gray
-
-    # 2. Bit shift to 8-bit
-    shift = settings["cine_shifts"].get(cam_idx, 0)
-    if shift > 0:
-        result = (result / (2 ** shift))
-    result = np.clip(result, 0, 255).astype(np.uint8)
-
-    # 3. Invert (only if not already handled by BG subtraction)
-    if settings["invert"] and not (settings["bg_enabled"] and bg_data is not None):
-        result = 255 - result
-
-    # 4. Range adjustment
-    result = imadjust_opencv(result, settings["low_in"], settings["high_in"])
-
-    # 5. Denoise
-    if settings["denoise"]:
-        a = result.astype(np.float32)
-        kernel = np.ones((3, 3), np.uint8)
-        b = cv2.erode(a, kernel, iterations=1)
-        c = a - b
-        b = cv2.erode(a, kernel, iterations=1)
-        c = c - b
-
-        d = cv2.GaussianBlur(c, (0, 0), 0.5)
-        e = cv2.blur(d, (100, 100))
-        f = a - e
-
-        blurred_f = cv2.GaussianBlur(f, (0, 0), 1.0)
-        sharp = f + 0.8 * (f - blurred_f)
-        result = np.clip(sharp, 0, 255).astype(np.uint8)
-
-    return result.astype(np.uint8)
+    """Compatibility wrapper for GUI code."""
+    return apply_processing_pipeline_with_settings(img_data, bg_data, cam_idx, settings)
 
 
 class PreprocessWorker(QObject):
@@ -1236,6 +1164,21 @@ class ImagePreprocessingView(QWidget):
         """)
         apply_btn.clicked.connect(self._on_process_clicked)
         settings_layout.addWidget(apply_btn)
+
+        generate_cli_btn = QPushButton("Generate CLI")
+        generate_cli_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1f5f3a;
+                color: white;
+                border: 1px solid #2d7a4d;
+                border-radius: 4px;
+                padding: 10px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #2d7a4d; }
+        """)
+        generate_cli_btn.clicked.connect(self._on_generate_cli_clicked)
+        settings_layout.addWidget(generate_cli_btn)
         
         settings_scroll.setWidget(settings_widget)
         content_layout.addWidget(settings_scroll)
@@ -1894,6 +1837,223 @@ class ImagePreprocessingView(QWidget):
         """Apply current settings to all loaded images."""
         # TODO: Implement batch processing
         print(f"Apply to all images")
+
+    def _quote_cli_arg(self, value):
+        """Quote a CLI argument for POSIX/Linux shells used on clusters."""
+        return shlex.quote(str(value))
+
+    def _relative_cli_path(self, value):
+        """Return a cwd-relative path when possible, preserving placeholders."""
+        text = str(value)
+        if text.startswith("/path/to/"):
+            return text
+        try:
+            abs_path = os.path.abspath(text)
+            rel_path = os.path.relpath(abs_path, os.getcwd())
+            return rel_path
+        except Exception:
+            return text
+
+    def _format_cli_command(self, cmd_parts):
+        return " ".join(self._quote_cli_arg(part) for part in cmd_parts)
+
+    def _make_relative_cli_command(self, cmd_parts):
+        path_options = {"--input-root", "--input-list", "--image", "--cine", "--output-dir"}
+        relative_parts = list(cmd_parts)
+        idx = 0
+        while idx < len(relative_parts) - 1:
+            if relative_parts[idx] in path_options:
+                relative_parts[idx + 1] = self._relative_cli_path(relative_parts[idx + 1])
+                idx += 2
+            else:
+                idx += 1
+        return self._format_cli_command(relative_parts)
+
+    def _selected_batch_indices(self, count):
+        start_idx = max(0, int(self.batch_start_spin.value()))
+        end_idx = min(int(self.batch_end_spin.value()), max(0, count - 1))
+        if end_idx < start_idx:
+            return []
+        return list(range(start_idx, end_idx + 1))
+
+    def _infer_common_cine_root(self, sorted_items):
+        """Infer ROOT for --input-root when loaded CINE files come from ROOT/CamN/*.cine."""
+        camera_dirs = []
+        for _, images in sorted_items:
+            indices = self._selected_batch_indices(len(images))
+            if not indices:
+                return None
+            cine_files = []
+            for idx in indices:
+                entry = images[idx]
+                if "#" not in entry:
+                    return None
+                cine_file, _ = entry.rsplit("#", 1)
+                cine_files.append(os.path.abspath(cine_file))
+            unique_cines = sorted(set(cine_files))
+            if len(unique_cines) != 1:
+                return None
+            camera_dirs.append(os.path.dirname(unique_cines[0]))
+
+        if len(camera_dirs) < 2:
+            return None
+
+        root_dir = os.path.commonpath(camera_dirs)
+        if any(os.path.dirname(camera_dir) != root_dir for camera_dir in camera_dirs):
+            return None
+        if len({os.path.basename(camera_dir).casefold() for camera_dir in camera_dirs}) != len(camera_dirs):
+            return None
+        return root_dir
+
+    def _build_preprocess_cli_command(self):
+        """Build a best-effort CLI command that mirrors the current GUI preprocessing settings."""
+        project_path = self.project_path_input.text().strip()
+        if not project_path:
+            raise ValueError("Please set Project Path (for Output) before generating a CLI command.")
+        if not self.camera_images:
+            raise ValueError("Please load images before generating a CLI command.")
+
+        output_dir = os.path.join(os.path.abspath(project_path), "imgFile")
+        cmd = ["openlpt", "preprocess"]
+        notes = [
+            "Generated for a POSIX/Linux shell. The CLI also strips outer quotes from path arguments, so copied Windows CMD commands still work.",
+            "Both commands explicitly include --output-dir from Project Path, writing processed images under Project Path/imgFile.",
+        ]
+
+        sorted_items = [(cam_idx, images) for cam_idx, images in sorted(self.camera_images.items()) if images]
+        if not sorted_items:
+            raise ValueError("No loaded images were found for CLI generation.")
+        gui_uses_zero_based_cameras = any(cam_idx == 0 for cam_idx, _ in sorted_items)
+        if gui_uses_zero_based_cameras:
+            notes.append("GUI camera tabs are zero-based; the CLI command maps them to one-based cam1, cam2, ... outputs.")
+
+        is_cine = all("#" in images[0] for _, images in sorted_items)
+        if is_cine:
+            common_cine_root = self._infer_common_cine_root(sorted_items)
+            cine_files = []
+            frame_starts = []
+            frame_ends = []
+            for _, images in sorted_items:
+                indices = self._selected_batch_indices(len(images))
+                if not indices:
+                    continue
+                first_entry = images[indices[0]]
+                last_entry = images[indices[-1]]
+                cine_file, start_frame = first_entry.rsplit("#", 1)
+                last_cine_file, end_frame = last_entry.rsplit("#", 1)
+                if os.path.abspath(cine_file) != os.path.abspath(last_cine_file):
+                    notes.append("One camera appears to span multiple CINE files; verify the generated --frames range manually.")
+                cine_files.append(cine_file)
+                frame_starts.append(int(start_frame))
+                frame_ends.append(int(end_frame))
+
+            if not cine_files:
+                raise ValueError("The selected batch range contains no CINE frames.")
+            if common_cine_root:
+                cmd.extend(["--input-root", common_cine_root])
+                notes.append("Detected a common CINE root; the CLI can auto-detect cameras with --input-root.")
+            else:
+                for cine_file in cine_files:
+                    cmd.extend(["--cine", cine_file])
+            cmd.extend(["--frames", str(min(frame_starts)), str(max(frame_ends))])
+        else:
+            if len(sorted_items) == 1:
+                cam_idx, images = sorted_items[0]
+                cli_cam_idx = cam_idx + 1 if gui_uses_zero_based_cameras else cam_idx
+                indices = self._selected_batch_indices(len(images))
+                if not indices:
+                    raise ValueError("The selected batch range contains no images.")
+                for idx in indices:
+                    cmd.extend(["--image", images[idx]])
+                cmd.extend(["--camera-index", str(cli_cam_idx)])
+                notes.append(
+                    "For large TIFF batches, prefer --input-list instead of many --image arguments if an image-list file is available."
+                )
+            else:
+                notes.append(
+                    "Multiple TIFF cameras are loaded in the GUI. The CLI cannot infer the original image-list files from GUI state, "
+                    "so replace the placeholder --input-list paths below with your camera image list text files."
+                )
+                for cam_idx, _ in sorted_items:
+                    cli_cam_idx = cam_idx + 1 if gui_uses_zero_based_cameras else cam_idx
+                    cmd.extend(["--input-list", f"/path/to/cam{cli_cam_idx}ImageNames.txt"])
+
+        cmd.extend(["--output-dir", output_dir])
+
+        if self.invert_check.isChecked():
+            cmd.append("--invert")
+
+        if self.bg_enabled.isChecked():
+            cmd.extend(["--background", "mean"])
+            cmd.extend(["--bg-start", str(max(0, int(self.batch_start_spin.value())))])
+            cmd.extend(["--bg-count", str(int(self.avg_count_spin.value()))])
+            cmd.extend(["--bg-stride", str(max(1, int(self.skip_frames_spin.value())))])
+
+        cmd.extend(["--low-in", str(int(self.range_slider.minValue()))])
+        cmd.extend(["--high-in", str(int(self.range_slider.maxValue()))])
+
+        if self.denoise_check.isChecked():
+            cmd.append("--denoise")
+
+        cmd.extend(["--workers", "0"])
+
+        absolute_command = self._format_cli_command(cmd)
+        relative_command = self._make_relative_cli_command(cmd)
+        return absolute_command, relative_command, notes
+
+    def _on_generate_cli_clicked(self):
+        """Show a generated CLI command for the current preprocessing settings."""
+        try:
+            absolute_command, relative_command, notes = self._build_preprocess_cli_command()
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot Generate CLI", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Generated Preprocessing CLI")
+        dialog.setMinimumSize(820, 420)
+
+        layout = QVBoxLayout(dialog)
+
+        note_label = QLabel("\n".join(f"• {note}" for note in notes))
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("color: #dddddd; padding: 4px;")
+        layout.addWidget(note_label)
+
+        path_mode_row = QHBoxLayout()
+        path_mode_label = QLabel("Path mode:")
+        path_mode_label.setStyleSheet("color: white; font-weight: bold;")
+        path_mode_combo = QComboBox()
+        path_mode_combo.addItem("Absolute path", absolute_command)
+        path_mode_combo.addItem("Relative path", relative_command)
+        path_mode_combo.setStyleSheet("background-color: #1a1a2e; color: white; border: 1px solid #444; padding: 4px;")
+        path_mode_row.addWidget(path_mode_label)
+        path_mode_row.addWidget(path_mode_combo)
+        layout.addLayout(path_mode_row)
+
+        command_text = QTextEdit()
+        command_text.setPlainText(absolute_command)
+        command_text.setReadOnly(True)
+        command_text.setStyleSheet(
+            "background-color: #0d1117; color: #7ee787; font-family: Consolas, monospace; padding: 10px;"
+        )
+        layout.addWidget(command_text)
+
+        def update_command_text(index):
+            command_text.setPlainText(path_mode_combo.itemData(index))
+
+        path_mode_combo.currentIndexChanged.connect(update_command_text)
+
+        button_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy Command")
+        close_btn = QPushButton("Close")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(path_mode_combo.currentData()))
+        close_btn.clicked.connect(dialog.close)
+        button_row.addWidget(copy_btn)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        dialog.exec()
 
     def _on_process_clicked(self):
         """Start batch processing in worker thread."""
