@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <omp.h>
 #include <sstream>
 #include <time.h>
@@ -76,6 +77,11 @@ private:
       3 // dimensionality
       >;
 
+  struct LinkCandidate {
+    int id = UNLINKED;
+    double cost = std::numeric_limits<double>::infinity();
+  };
+
   // Track based on velocity field
   void runInitPhase(int frame_id, std::vector<Image> &img_list);
 
@@ -89,8 +95,8 @@ private:
   std::unique_ptr<Object3D> predictNext(const Track &tr) const;
 
   // find nearest neighbor around a position
-  int findNN(KDTreeObj3d const &tree_obj3d, Pt3D const &pt3d_est,
-             double radius) const;
+  LinkCandidate findNN(KDTreeObj3d const &tree_obj3d,
+                       Pt3D const &pt3d_est, double radius) const;
 
   // check whether objects found by IPR are repeated with the last point in
   // active long tracks
@@ -99,9 +105,9 @@ private:
 
   // int linkShortTrack (Track<T3D> const& track, std::vector<T3D> const&
   // obj3d_list, int n_iter);
-  int linkShortTrack(Track const &track, int n_iter,
-                     KDTreeObj3d const &tree_obj3d,
-                     KDTreeTrack const &tree_track);
+  LinkCandidate linkShortTrack(Track const &track, int n_iter,
+                               KDTreeObj3d const &tree_obj3d,
+                               KDTreeTrack const &tree_track);
 
   bool checkLinearFit(Track const &track);
 

@@ -34,7 +34,7 @@ struct DebugAccess_STB
                       const Pt3D &pt3d_est,
                       double radius)
     {
-        return self.findNN(tree_obj3d, pt3d_est, radius);
+        return self.findNN(tree_obj3d, pt3d_est, radius).id;
     }
 
     static std::vector<ObjFlag> checkRepeat(const STB &self,
@@ -49,7 +49,7 @@ struct DebugAccess_STB
                               const STB::KDTreeObj3d &tree_obj3d,
                               const STB::KDTreeTrack &tree_track)
     {
-        return self.linkShortTrack(track, n_iter, tree_obj3d, tree_track);
+        return self.linkShortTrack(track, n_iter, tree_obj3d, tree_track).id;
     }
 
     static bool checkLinearFit(STB &self, const Track &track) {

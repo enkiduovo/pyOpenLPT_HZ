@@ -175,10 +175,11 @@ void STB::buildTrackFromPredField(int frame_id, const PredField *pf) {
     for (int j = 0; j < n_sa; j++) {
       Pt3D vel_curr =
           pf->getDisp(_short_track_active[j]._obj3d_list.back()->_pt_center);
-      link_id[j] = findNN(
+      const LinkCandidate link = findNN(
           tree_obj3d,
           _short_track_active[j]._obj3d_list.back()->_pt_center + vel_curr,
           _obj_config->_stb_param._radius_search_obj);
+      link_id[j] = link.id;
     }
     // update short track and _is_tracked status for the next frame
     for (int j = n_sa - 1; j > -1;
@@ -314,10 +315,10 @@ std::unique_ptr<Object3D> STB::predictNext(const Track &tr) const {
   return obj3d;
 }
 
-int STB::findNN(KDTreeObj3d const &tree_obj3d, Pt3D const &pt3d_est,
-                double radius) const {
-  double min_dist2 = radius * radius;
-  int obj_id = UNLINKED;
+STB::LinkCandidate STB::findNN(KDTreeObj3d const &tree_obj3d,
+                               Pt3D const &pt3d_est, double radius) const {
+  const double max_dist2 = radius * radius;
+  LinkCandidate candidate;
 
   size_t ret_index = 0;
   double out_dist_sqr = 0;
@@ -326,11 +327,12 @@ int STB::findNN(KDTreeObj3d const &tree_obj3d, Pt3D const &pt3d_est,
   tree_obj3d.findNeighbors(resultSet, pt3d_est.data(),
                            nanoflann::SearchParameters());
 
-  if (out_dist_sqr < min_dist2) {
-    obj_id = ret_index;
+  if (out_dist_sqr < max_dist2) {
+    candidate.id = static_cast<int>(ret_index);
+    candidate.cost = out_dist_sqr;
   }
 
-  return obj_id;
+  return candidate;
 }
 
 void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
@@ -477,8 +479,7 @@ void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
     std::cout << " Linking: ";
     t_start = clock();
 
-    std::vector<int> link_id(n_sa, 0);
-    std::vector<int> is_obj_used(n_obj3d, 0);
+    std::vector<LinkCandidate> link_candidate(n_sa);
 
     // build kd tree for obj3d_list
     Obj3dCloud cloud_obj3d(obj3d_list);
@@ -490,27 +491,30 @@ void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
     KDTreeTrack tree_track(3, cloud_track, {10 /* max leaf */});
     tree_track.buildIndex();
 
-// query the kd tree for each active short track
+    // query the kd tree for each active short track
 #pragma omp parallel for if (!omp_in_parallel())
     for (int i = 0; i < n_sa; i++) {
-      link_id[i] =
+      link_candidate[i] =
           linkShortTrack(_short_track_active[i], 5, tree_obj3d, tree_track);
     }
 
-    // Resolve conflicts: if multiple short tracks link to the same obj, only
-    // keep one link (first-come-first-served) TODO: optimize this part
+    // Resolve conflicts: if multiple short tracks link to the same object, keep
+    // the claimant whose velocity-predicted position is closest to that object.
     const int n_cand = n_obj3d;
     std::vector<int> owner(n_cand, -1);
 
     for (int j = 0; j < n_sa; ++j) {
-      const int lid = link_id[j];
+      const int lid = link_candidate[j].id;
       if (lid == UNLINKED || lid < 0 || lid >= n_cand)
         continue;
 
       if (owner[lid] == -1) {
         owner[lid] = j;
+      } else if (link_candidate[j].cost < link_candidate[owner[lid]].cost) {
+        link_candidate[owner[lid]].id = UNLINKED;
+        owner[lid] = j;
       } else {
-        link_id[j] = UNLINKED;
+        link_candidate[j].id = UNLINKED;
       }
     }
 
@@ -518,7 +522,7 @@ void STB::runConvPhase(int frame, std::vector<Image> &img_list) {
     size_t write = 0;
 
     for (int i = 0; i < n_sa; ++i) {
-      const int lid = link_id[i];
+      const int lid = link_candidate[i].id;
 
       if (lid != UNLINKED && lid >= 0 && lid < n_obj3d && obj3d_list[lid]) {
         // Mark the candidate as taken BEFORE moving it
@@ -749,24 +753,24 @@ STB::checkRepeat(const std::vector<std::unique_ptr<Object3D>> &objs) const {
   return flags;
 }
 
-int STB::linkShortTrack(Track const &track, int n_iter,
-                        KDTreeObj3d const &tree_obj3d,
-                        KDTreeTrack const &tree_track) {
+STB::LinkCandidate STB::linkShortTrack(Track const &track, int n_iter,
+                                       KDTreeObj3d const &tree_obj3d,
+                                       KDTreeTrack const &tree_track) {
   // --- Early checks --------------------------------------------------------
   if (track._obj3d_list.empty() || !track._obj3d_list.back())
-    return UNLINKED;
+    return {};
 
   const Pt3D &p_last = track._obj3d_list.back()->_pt_center;
 
   const double base_r = _obj_config->_stb_param._radius_search_track;
   if (base_r <= 0.0)
-    return UNLINKED;
+    return {};
 
   // Iterative expansion factor (grow^step); avoid pow() inside the loop.
   constexpr double grow = 1.1;
   double factor = 1.0; // equals grow^step
 
-  int obj3d_id = UNLINKED;
+  LinkCandidate best_link;
 
   for (int step = 0; step < n_iter; ++step) {
     factor = (step == 0) ? 1.0 : factor * grow;
@@ -860,8 +864,8 @@ int STB::linkShortTrack(Track const &track, int n_iter,
     // Expanding object-association radius as well
     const double r_obj = base_r * factor;
 
-    obj3d_id = findNN(tree_obj3d, est, r_obj);
-    if (obj3d_id != UNLINKED) {
+    best_link = findNN(tree_obj3d, est, r_obj);
+    if (best_link.id != UNLINKED) {
       break; // success
     }
 
@@ -871,13 +875,13 @@ int STB::linkShortTrack(Track const &track, int n_iter,
     // behavior:
     //
     if (indices_dists.empty()) {
-      obj3d_id = findNN(tree_obj3d, p_last, r_obj);
-      if (obj3d_id != UNLINKED)
+      best_link = findNN(tree_obj3d, p_last, r_obj);
+      if (best_link.id != UNLINKED)
         break;
     }
   }
 
-  return obj3d_id;
+  return best_link;
 }
 
 bool STB::checkLinearFit(Track const &track) {
