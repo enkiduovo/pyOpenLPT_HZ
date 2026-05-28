@@ -69,6 +69,10 @@ test/
 !.sisyphus/plans/**
 
 scripts/
+artifacts/
+tests/
+test/inputs/test_LPTNetBenchmark
+docs/
 
 Paper/
 
