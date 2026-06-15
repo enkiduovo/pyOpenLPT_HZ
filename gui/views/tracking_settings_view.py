@@ -6,15 +6,68 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QPushButton, QGroupBox, QGridLayout, QSpinBox, QDoubleSpinBox,
     QCheckBox, QScrollArea, QFileDialog, QLineEdit, QTabWidget, QMessageBox,
-    QComboBox
+    QComboBox, QDialog, QTextEdit, QApplication
 )
 from PySide6.QtCore import Qt
 import os
+import shlex
 import multiprocessing
 import qtawesome as qta
 import numpy as np
 import re
+from pathlib import Path
 import cv2
+
+
+class _ValidationStatusDialog(QDialog):
+    """HZ_fix: lightweight, non-blocking status display for 'Validate Settings'.
+
+    Replaces QProgressDialog's indeterminate busy-bar (not useful here - we
+    don't know the total work ahead of time) with a single status label and
+    a Stop button. processEvents() is called frequently throughout the
+    validation loop so this stays responsive and wasCanceled() reflects a
+    Stop click almost immediately, even mid-frame.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Validating Settings")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setMinimumWidth(420)
+        self.setStyleSheet("""
+            QDialog { background-color: #2b2b2b; }
+            QLabel { color: #ffffff; font-size: 13px; font-weight: bold; background-color: transparent; }
+            QPushButton {
+                background-color: #5a1f1f; color: white; border: 1px solid #7a2d2d;
+                border-radius: 4px; padding: 6px 16px; font-size: 13px;
+            }
+            QPushButton:hover { background-color: #7a2d2d; }
+        """)
+
+        layout = QVBoxLayout(self)
+        self.label = QLabel("Verifying Settings...")
+        self.label.setWordWrap(True)
+        layout.addWidget(self.label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self._on_stop)
+        button_row.addWidget(self.stop_btn)
+        layout.addLayout(button_row)
+
+        self._canceled = False
+
+    def _on_stop(self):
+        self._canceled = True
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("Stopping...")
+
+    def wasCanceled(self):
+        return self._canceled
+
+    def setLabelText(self, text):
+        self.label.setText(text)
 
 
 class TrackingSettingsView(QWidget):
@@ -506,17 +559,36 @@ class TrackingSettingsView(QWidget):
         
         actions_layout.addWidget(actions_title)
         
+        validate_btn = QPushButton(" Validate Settings")
+        validate_btn.setIcon(qta.icon("fa5s.check", color="white"))
+        validate_btn.clicked.connect(self._validate_settings)
+        actions_layout.addWidget(validate_btn)
+
+        # HZ_fix: "Generate CLI" - same green style as the Preprocessing /
+        # Wand Calibration pages. Shows the cli_tracking_settings.py command
+        # equivalent to "Save Configuration" with the CURRENT field values.
+        generate_cli_btn = QPushButton(" Generate CLI")
+        generate_cli_btn.setIcon(qta.icon("fa5s.terminal", color="white"))
+        generate_cli_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1f5f3a;
+                color: white;
+                border: 1px solid #2d7a4d;
+                border-radius: 4px;
+                padding: 10px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #2d7a4d; }
+        """)
+        generate_cli_btn.clicked.connect(self._on_generate_cli_clicked)
+        actions_layout.addWidget(generate_cli_btn)
+
         save_btn = QPushButton(" Save Configuration")
         save_btn.setIcon(qta.icon("fa5s.save", color="white"))
         save_btn.setObjectName("primaryButton")
         save_btn.clicked.connect(self._save_configuration)
         actions_layout.addWidget(save_btn)
 
-        validate_btn = QPushButton(" Validate Settings")
-        validate_btn.setIcon(qta.icon("fa5s.check", color="white"))
-        validate_btn.clicked.connect(self._validate_settings)
-        actions_layout.addWidget(validate_btn)
-        
         actions_layout.addStretch()
         
         layout.addWidget(actions_frame)
@@ -727,13 +799,22 @@ class TrackingSettingsView(QWidget):
             print(f"[TrackingSettings] Auto-saved {saved_count} camera params to {cam_dir}")
             calibrator.params_dirty = False # Clear dirty flag after successful save
             
-    def _save_configuration(self):
-        """Save config.txt and [type]Config.txt to project directory."""
-        project_dir = self.project_path.text().strip()
-        if not project_dir or not os.path.isdir(project_dir):
-            QMessageBox.warning(self, "Invalid Path", "Please select a valid Project Directory first.")
-            return
+    def _render_config_files(self, project_dir, path_mode="relative"):
+        """Build the config.txt and [type]Config.txt CONTENTS from the
+        current UI state, without writing anything to disk.
 
+        path_mode:
+          - "relative": camFile/imgFile/output paths are written relative to
+            project_dir (the normal, portable form saved by "Save
+            Configuration").
+          - "absolute": those paths are written as ABSOLUTE paths to the
+            real project's camFile/imgFile/output directories, regardless of
+            where config.txt itself ends up. Used by "Validate Settings" to
+            write a TEMP config.txt (in a different directory) that still
+            points at the real project's data.
+
+        Returns (master_config_text, stb_config_text, stb_config_name).
+        """
         project_dir = os.path.abspath(project_dir)
 
         def _clean_ui_path(path_text):
@@ -748,6 +829,8 @@ class TrackingSettingsView(QWidget):
             p = _clean_ui_path(path_text)
             if not p:
                 return ""
+            if path_mode == "absolute":
+                return os.path.abspath(p).replace('\\', '/')
             if not os.path.isabs(p):
                 return p.replace('\\', '/')
             try:
@@ -768,122 +851,285 @@ class TrackingSettingsView(QWidget):
         obj_type = self.obj_type_combo.currentText()
         stb_config_name = "tracerConfig.txt" if obj_type == "Tracer" else "bubbleConfig.txt"
         stb_config_rel = stb_config_name
-        stb_config_path_abs = os.path.join(project_dir, stb_config_name).replace('\\', '/')
-        master_config_path_abs = os.path.join(project_dir, "config.txt").replace('\\', '/')
+
+        master_lines = []
+        master_lines.append("# Frame Range: [startID,endID]")
+        master_lines.append(f"{self.frame_start_spin.value()},{self.frame_end_spin.value()}")
+
+        master_lines.append("# Frame Rate: [Hz]")
+        master_lines.append(f"{self.fps_spin.value()}")
+
+        master_lines.append("# Number of Threads: (0: use as many as possible)")
+        master_lines.append(f"{self.n_threads_spin.value()}")
+
+        master_lines.append("# Number of Cameras: ")
+        n_cams = self.n_cam_spin.value()
+        master_lines.append(f"{n_cams}")
+
+        master_lines.append("# Camera File Path, Max Intensity")
+        cam_dir_rel = _to_rel(self.camera_path_display.text())
+        for i in range(n_cams):
+            if i < len(self.detected_cam_files):
+                fname = self.detected_cam_files[i]
+                master_lines.append(f"{_join_rel(cam_dir_rel, fname)},255")
+            else:
+                master_lines.append(f"{_join_rel(cam_dir_rel, f'cam{i}.txt')},255")
+
+        master_lines.append("# Image File Path")
+        img_dir_rel = _to_rel(self.image_path_display.text())
+        for i in range(n_cams):
+            master_lines.append(f"{_join_rel(img_dir_rel, f'cam{i}ImageNames.txt')}")
+
+        master_lines.append("# View Volume: (xmin,xmax,ymin,ymax,zmin,zmax)")
+        vol_str = f"{self.vol_x_min.value()},{self.vol_x_max.value()}," \
+                  f"{self.vol_y_min.value()},{self.vol_y_max.value()}," \
+                  f"{self.vol_z_min.value()},{self.vol_z_max.value()}"
+        master_lines.append(f"{vol_str}")
+
+        master_lines.append("# Voxel to MM: e.g. use 1000^3 voxel, (xmax-xmin)/1000")
+        master_lines.append(f"{self.voxel_spin.value()}")
+
+        master_lines.append("# Output Folder Path: ")
+        master_lines.append(f"{_to_rel(self.output_path.text())}")
+
+        master_lines.append("# Object Types: ")
+        master_lines.append(f"{obj_type}")
+
+        master_lines.append("# STB Config Files:")
+        master_lines.append(f"{stb_config_rel}")
+
+        master_lines.append("# Flag to load previous track files, previous frameID")
+        resume_flag = 1 if self.resume_check.isChecked() else 0
+        master_lines.append(f"{resume_flag},{self.resume_frame_spin.value()}")
+
+        results_path_rel = _to_rel(self.output_path.text())
+        master_lines.append("# Path to active long track files")
+        master_lines.append(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/")
+        master_lines.append("# Path to active short track files")
+        master_lines.append(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/")
+
+        master_config_text = "\n".join(master_lines) + "\n"
+
+        stb_lines = []
+        stb_lines.append("############################")
+        stb_lines.append("######### Tracking #########")
+        stb_lines.append("############################")
+        stb_lines.append("######### Initial Phase ############## ")
+        stb_lines.append(f"{self.stb_initial_radius.value()} # Search radius for connecting tracks to objects")
+        stb_lines.append(f"{self.stb_initial_frames.value()} # Number of frames for initial phase")
+        stb_lines.append("######### Convergence Phase ############# ")
+        stb_lines.append(f"{self.stb_avg_spacing.value()} # Avg Interparticle spacing. (vox) to identify neighbour tracks ")
+        stb_lines.append("")
+
+        stb_lines.append("#########################")
+        stb_lines.append("######### Shake #########")
+        stb_lines.append("#########################")
+        stb_lines.append(f"{self.shake_width.value()} # shake width 0.25")
+        stb_lines.append("")
+
+        stb_lines.append("#################################")
+        stb_lines.append("######### Predict Field #########")
+        stb_lines.append("#################################")
+        stb_lines.append(f"{self.pred_grid_x.value()} # xgrid ")
+        stb_lines.append(f"{self.pred_grid_y.value()} # ygrid")
+        stb_lines.append(f"{self.pred_grid_z.value()} # zgrid")
+        stb_lines.append(f"{self.pred_search_radius.value()} # searchRadius [voxel]")
+        stb_lines.append("")
+
+        stb_lines.append("#######################")
+        stb_lines.append("######### IPR #########")
+        stb_lines.append("#######################")
+        stb_lines.append(f"{self.ipr_loop_spin.value()}   # No. of IPR loop")
+        stb_lines.append(f"{self.shake_loops.value()}   # No. of Shake loop")
+        stb_lines.append(f"{self.shake_ghost.value()} # ghost threshold")
+        stb_lines.append(f"{self.ipr_2d_tol.value()}   # 2D tolerance [px]")
+        stb_lines.append(f"{self.ipr_3d_tol.value()}  # 3D tolerance [voxel]")
+        stb_lines.append("")
+
+        stb_lines.append(f"{self.ipr_reduce_spin.value()} # number of reduced camera")
+        stb_lines.append(f"{self.ipr_reduced_spin.value()} # no. of ipr loops for each reduced camera combination")
+        stb_lines.append("")
+        stb_lines.append("")
+
+        stb_lines.append("###############################")
+        stb_lines.append("######### Object Info #########")
+        stb_lines.append("###############################")
+        if obj_type == "Tracer":
+            stb_lines.append(f"{self.tracer_int_thresh.value()} # 2D particle finder threshold")
+            stb_lines.append(f"{self.tracer_radius.value()} # Particle radius [px], for calculating residue image and shaking")
+        else:
+            stb_lines.append(f"{self.bubble_min_rad.value()}   # minimum bubble size to track")
+            stb_lines.append(f"{self.bubble_max_rad.value()}  # maximum bubble size to track")
+            stb_lines.append(f"{self.bubble_sens.value()} # sensitivity of identify circles")
+
+        stb_config_text = "\n".join(stb_lines) + "\n"
+
+        return master_config_text, stb_config_text, stb_config_name
+
+    def _save_configuration(self):
+        """Save config.txt and [type]Config.txt to project directory."""
+        project_dir = self.project_path.text().strip()
+        if not project_dir or not os.path.isdir(project_dir):
+            QMessageBox.warning(self, "Invalid Path", "Please select a valid Project Directory first.")
+            return
+
+        project_dir = os.path.abspath(project_dir)
 
         try:
-            # 1. Save Master config.txt
+            master_config_text, stb_config_text, stb_config_name = self._render_config_files(
+                project_dir, path_mode="relative"
+            )
+
+            master_config_path_abs = os.path.join(project_dir, "config.txt").replace('\\', '/')
+            stb_config_path_abs = os.path.join(project_dir, stb_config_name).replace('\\', '/')
+
             with open(master_config_path_abs, 'w') as f:
-                f.write("# Frame Range: [startID,endID]\n")
-                f.write(f"{self.frame_start_spin.value()},{self.frame_end_spin.value()}\n")
-                
-                f.write("# Frame Rate: [Hz]\n")
-                f.write(f"{self.fps_spin.value()}\n")
-                
-                f.write("# Number of Threads: (0: use as many as possible)\n")
-                f.write(f"{self.n_threads_spin.value()}\n")
-                
-                f.write("# Number of Cameras: \n")
-                n_cams = self.n_cam_spin.value()
-                f.write(f"{n_cams}\n")
-                
-                fwrite_cam_info = "# Camera File Path, Max Intensity\n"
-                f.write(fwrite_cam_info)
-                cam_dir_rel = _to_rel(self.camera_path_display.text())
-                for i in range(n_cams):
-                    if i < len(self.detected_cam_files):
-                        # Use actual detected filename (e.g. vsc_cam1.txt)
-                        fname = self.detected_cam_files[i]
-                        f.write(f"{_join_rel(cam_dir_rel, fname)},255\n")
-                    else:
-                        # Fallback if request n_cams > detected files
-                        f.write(f"{_join_rel(cam_dir_rel, f'cam{i}.txt')},255\n")
-                
-                f.write("# Image File Path\n")
-                img_dir_rel = _to_rel(self.image_path_display.text())
-                for i in range(n_cams):
-                    f.write(f"{_join_rel(img_dir_rel, f'cam{i}ImageNames.txt')}\n")
-                
-                f.write("# View Volume: (xmin,xmax,ymin,ymax,zmin,zmax)\n")
-                vol_str = f"{self.vol_x_min.value()},{self.vol_x_max.value()}," \
-                          f"{self.vol_y_min.value()},{self.vol_y_max.value()}," \
-                          f"{self.vol_z_min.value()},{self.vol_z_max.value()}"
-                f.write(f"{vol_str}\n")
-                
-                f.write("# Voxel to MM: e.g. use 1000^3 voxel, (xmax-xmin)/1000\n")
-                f.write(f"{self.voxel_spin.value()}\n")
-                
-                f.write("# Output Folder Path: \n")
-                f.write(f"{_to_rel(self.output_path.text())}\n")
-                
-                f.write("# Object Types: \n")
-                f.write(f"{obj_type}\n")
-                
-                f.write("# STB Config Files:\n")
-                f.write(f"{stb_config_rel}\n")
-                
-                f.write("# Flag to load previous track files, previous frameID\n")
-                resume_flag = 1 if self.resume_check.isChecked() else 0
-                f.write(f"{resume_flag},{self.resume_frame_spin.value()}\n")
-                
-                results_path_rel = _to_rel(self.output_path.text())
-                f.write("# Path to active long track files\n")
-                f.write(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/\n")
-                f.write("# Path to active short track files\n")
-                f.write(f"{_join_rel(results_path_rel, 'ConvergeTrack')}/\n")
+                f.write(master_config_text)
 
-            # 2. Save [type]Config.txt
             with open(stb_config_path_abs, 'w') as f:
-                f.write("############################\n")
-                f.write("######### Tracking #########\n")
-                f.write("############################\n")
-                f.write("######### Initial Phase ############## \n")
-                f.write(f"{self.stb_initial_radius.value()} # Search radius for connecting tracks to objects\n")
-                f.write(f"{self.stb_initial_frames.value()} # Number of frames for initial phase\n")
-                f.write("######### Convergence Phase ############# \n")
-                f.write(f"{self.stb_avg_spacing.value()} # Avg Interparticle spacing. (vox) to identify neighbour tracks \n\n")
-
-                f.write("#########################\n")
-                f.write("######### Shake #########\n")
-                f.write("#########################\n")
-                f.write(f"{self.shake_width.value()} # shake width 0.25\n\n")
-
-                f.write("#################################\n")
-                f.write("######### Predict Field #########\n")
-                f.write("#################################\n")
-                f.write(f"{self.pred_grid_x.value()} # xgrid \n")
-                f.write(f"{self.pred_grid_y.value()} # ygrid\n")
-                f.write(f"{self.pred_grid_z.value()} # zgrid\n")
-                f.write(f"{self.pred_search_radius.value()} # searchRadius [voxel]\n\n")
-
-                f.write("#######################\n")
-                f.write("######### IPR #########\n")
-                f.write("#######################\n")
-                f.write(f"{self.ipr_loop_spin.value()}   # No. of IPR loop\n")
-                f.write(f"{self.shake_loops.value()}   # No. of Shake loop\n")
-                f.write(f"{self.shake_ghost.value()} # ghost threshold\n")
-                f.write(f"{self.ipr_2d_tol.value()}   # 2D tolerance [px]\n")
-                f.write(f"{self.ipr_3d_tol.value()}  # 3D tolerance [voxel]\n\n")
-
-                f.write(f"{self.ipr_reduce_spin.value()} # number of reduced camera\n")
-                f.write(f"{self.ipr_reduced_spin.value()} # no. of ipr loops for each reduced camera combination\n\n\n")
-
-                f.write("###############################\n")
-                f.write("######### Object Info #########\n")
-                f.write("###############################\n")
-                if obj_type == "Tracer":
-                    f.write(f"{self.tracer_int_thresh.value()} # 2D particle finder threshold\n")
-                    f.write(f"{self.tracer_radius.value()} # Particle radius [px], for calculating residue image and shaking\n")
-                else:
-                    f.write(f"{self.bubble_min_rad.value()}   # minimum bubble size to track\n")
-                    f.write(f"{self.bubble_max_rad.value()}  # maximum bubble size to track\n")
-                    f.write(f"{self.bubble_sens.value()} # sensitivity of identify circles\n")
+                f.write(stb_config_text)
 
             QMessageBox.information(self, "Success", f"Configuration saved to:\n{master_config_path_abs}\n{stb_config_path_abs}")
             print(f"[TrackingSettings] Saved config files to {project_dir}")
 
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save configuration:\n{str(e)}")
+
+    def _build_settings_cli_command(self):
+        """HZ_fix: Build the cli_tracking_settings.py command equivalent to
+        "Save Configuration" with the CURRENT field values.
+
+        Returns (command_str, project_dir). Raises ValueError if the project
+        directory isn't set (same check as _save_configuration).
+        """
+        project_dir = self.project_path.text().strip()
+        if not project_dir:
+            raise ValueError("Please set Project Path before generating a CLI command.")
+        project_dir = os.path.abspath(project_dir)
+
+        cli_script = str(Path(__file__).resolve().parents[2] / "cli_tracking_settings.py")
+
+        obj_type = "bubble" if self.obj_type_combo.currentText() == "Bubble" else "tracer"
+
+        cmd = ["python", cli_script, project_dir]
+        cmd += ["--object-type", obj_type]
+        cmd += ["--fps", str(self.fps_spin.value())]
+        cmd += ["--n-cameras", str(self.n_cam_spin.value())]
+        cmd += ["--frame-start", str(self.frame_start_spin.value())]
+        cmd += ["--frame-end", str(self.frame_end_spin.value())]
+        cmd += ["--n-threads", str(self.n_threads_spin.value())]
+
+        def _clean_path(text):
+            p = (text or "").strip()
+            if " (" in p:
+                p = p.split(" (")[0]
+            return p
+
+        img_path = _clean_path(self.image_path_display.text())
+        if img_path:
+            cmd += ["--image-path", img_path]
+        cam_path = _clean_path(self.camera_path_display.text())
+        if cam_path:
+            cmd += ["--camera-path", cam_path]
+        out_path = _clean_path(self.output_path.text())
+        if out_path:
+            cmd += ["--output-path", out_path]
+
+        cmd += ["--volume",
+                str(self.vol_x_min.value()), str(self.vol_x_max.value()),
+                str(self.vol_y_min.value()), str(self.vol_y_max.value()),
+                str(self.vol_z_min.value()), str(self.vol_z_max.value())]
+        cmd += ["--voxel-to-mm", str(self.voxel_spin.value())]
+
+        if self.resume_check.isChecked():
+            cmd += ["--resume"]
+            cmd += ["--resume-frame", str(self.resume_frame_spin.value())]
+
+        cmd += ["--ipr-2d-tol", str(self.ipr_2d_tol.value())]
+        cmd += ["--ipr-3d-tol", str(self.ipr_3d_tol.value())]
+        cmd += ["--ipr-loops", str(self.ipr_loop_spin.value())]
+        cmd += ["--ipr-reduce-cam", str(self.ipr_reduce_spin.value())]
+        cmd += ["--ipr-reduced-loops", str(self.ipr_reduced_spin.value())]
+        cmd += ["--shake-width", str(self.shake_width.value())]
+        cmd += ["--shake-loops", str(self.shake_loops.value())]
+        cmd += ["--shake-ghost-thresh", str(self.shake_ghost.value())]
+        cmd += ["--stb-initial-radius", str(self.stb_initial_radius.value())]
+        cmd += ["--stb-initial-frames", str(self.stb_initial_frames.value())]
+        cmd += ["--stb-avg-spacing", str(self.stb_avg_spacing.value())]
+        cmd += ["--pred-grid",
+                str(self.pred_grid_x.value()), str(self.pred_grid_y.value()), str(self.pred_grid_z.value())]
+        cmd += ["--pred-search-radius", str(self.pred_search_radius.value())]
+
+        if obj_type == "tracer":
+            cmd += ["--tracer-int-thresh", str(self.tracer_int_thresh.value())]
+            cmd += ["--tracer-radius", str(self.tracer_radius.value())]
+        else:
+            cmd += ["--bubble-min-radius", str(self.bubble_min_rad.value())]
+            cmd += ["--bubble-max-radius", str(self.bubble_max_rad.value())]
+            cmd += ["--bubble-sensitivity", str(self.bubble_sens.value())]
+
+        command_str = " ".join(shlex.quote(part) for part in cmd)
+        return command_str, project_dir
+
+    def _on_generate_cli_clicked(self, checked=False):
+        """HZ_fix: Show the cli_tracking_settings.py command for the current
+        settings - the headless equivalent of "Save Configuration".
+
+        Running this command (e.g. in a SLURM script) writes the SAME
+        config.txt + bubbleConfig.txt/tracerConfig.txt as clicking "Save
+        Configuration" with the field values shown in the UI right now.
+        """
+        try:
+            command, project_dir = self._build_settings_cli_command()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot Generate CLI", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Generated Settings CLI")
+        dialog.setMinimumSize(900, 260)
+
+        layout = QVBoxLayout(dialog)
+
+        info_label = QLabel(
+            "Run this command (e.g. from a SLURM script) to write config.txt + "
+            "bubbleConfig.txt/tracerConfig.txt with the CURRENT settings, "
+            "without opening the GUI:"
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #dddddd; padding: 4px;")
+        layout.addWidget(info_label)
+
+        command_text = QTextEdit()
+        command_text.setPlainText(command)
+        command_text.setReadOnly(True)
+        command_text.setStyleSheet(
+            "background-color: #0d1117; color: #7ee787; font-family: Consolas, monospace; padding: 10px;"
+        )
+        layout.addWidget(command_text)
+
+        note_label = QLabel(
+            f"Project directory: {project_dir}\n"
+            "Add --dry-run to preview without writing files. "
+            "Auto-derived values (e.g. Number of Cameras, Frame End, View Volume, "
+            "IPR tolerances) are passed explicitly here so the result matches the "
+            "current UI exactly; remove flags you'd rather have re-derived from "
+            "imgFile/camFile on the run."
+        )
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("color: #999999; padding: 4px; font-size: 11px;")
+        layout.addWidget(note_label)
+
+        button_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy Command")
+        close_btn = QPushButton("Close")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(command))
+        close_btn.clicked.connect(dialog.close)
+        button_row.addWidget(copy_btn)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        dialog.exec()
 
     def _update_object_tab(self, index):
         """Update Object tab content based on selected Object Type."""
@@ -1518,223 +1764,445 @@ class TrackingSettingsView(QWidget):
 
         return pts_common.min(axis=0), pts_common.max(axis=0)
 
+    def _run_validation_on_frame(self, lpt, camera_models, obj_cfg, imgio_list,
+                                  frame_id, progress, num_cams, obj_type):
+        """Run 2D detection + 3D matching for ONE frame, then check whether
+        the bubble reference image (calBubbleRefImg, the SAME 3 gates the
+        tracking binary's IPR.cpp / BubbleRefImg.cpp use: every selected 3D
+        bubble must have radius>6px in EVERY camera, an intensity-peak
+        filter, and per-pixel coverage - all requiring >5 qualifying
+        bubbles) would succeed for this frame's matched 3D objects.
+
+        Returns a dict describing the outcome. Does NOT write any files and
+        does NOT call setValue() on any UI widget - tolerance bumps are
+        applied to a throwaway in-memory copy of obj_cfg's match params only,
+        for THIS frame's attempt, and restored before returning.
+        """
+        def _cancel_result():
+            return {
+                "frame_id": frame_id, "passed": False, "no_2d": False, "canceled": True,
+                "count_3d": 0, "avg_2d_count": 0, "camera_count_summary": "", "zero_camera_warning": "",
+                "tol_2d_px": 0.0, "tol_3d_mm": 0.0, "tol_2d_increase": 0.0, "tol_3d_increase_mm": 0.0,
+            }
+
+        QApplication.processEvents()
+        if progress.wasCanceled():
+            return _cancel_result()
+
+        image_list = []
+        progress.setLabelText(f"Loading Images (frame {frame_id})...")
+        QApplication.processEvents()
+        for i in range(num_cams):
+            image_list.append(imgio_list[i].loadImg(frame_id))
+
+        progress.setLabelText(f"Detecting 2D Objects (frame {frame_id})...")
+        QApplication.processEvents()
+
+        obj_finder = lpt.ObjectFinder2D()
+        obj2d_list = []
+        total_2d_count = 0
+        per_camera_2d_counts = []
+        for cam_id in range(num_cams):
+            if progress.wasCanceled():
+                return _cancel_result()
+            obj2ds = obj_finder.findObject2D(image_list[cam_id], obj_cfg)
+            obj2d_list.append(obj2ds)
+            count = len(obj2ds)
+            per_camera_2d_counts.append(count)
+            total_2d_count += count
+            print(f"[Validation] Frame {frame_id}, Camera {cam_id}: found {count} 2D objects.")
+            QApplication.processEvents()
+
+        avg_2d_count = total_2d_count / num_cams if num_cams > 0 else 0
+        camera_count_summary = ", ".join(
+            f"Cam {cam_id}: {count}" for cam_id, count in enumerate(per_camera_2d_counts)
+        ) or "No cameras"
+        zero_camera_ids = [cam_id for cam_id, count in enumerate(per_camera_2d_counts) if count == 0]
+        zero_camera_warning = ""
+        if zero_camera_ids:
+            zero_camera_warning = (
+                "\n\nWarning: no 2D objects were detected in camera(s): "
+                + ", ".join(str(cam_id) for cam_id in zero_camera_ids)
+                + "."
+            )
+
+        result = {
+            "frame_id": frame_id,
+            "passed": False,
+            "no_2d": False,
+            "canceled": False,
+            "count_3d": 0,
+            "avg_2d_count": avg_2d_count,
+            "camera_count_summary": camera_count_summary,
+            "zero_camera_warning": zero_camera_warning,
+            "tol_2d_px": obj_cfg._sm_param.tol_2d_px,
+            "tol_3d_mm": obj_cfg._sm_param.tol_3d_mm,
+            "tol_2d_increase": 0.0,
+            "tol_3d_increase_mm": 0.0,
+        }
+
+        if total_2d_count == 0:
+            result["no_2d"] = True
+            print(f"[Validation] Frame {frame_id}: no 2D objects detected in any camera.")
+            return result
+
+        progress.setLabelText(f"Matching 3D Objects (frame {frame_id}, 2D Avg: {avg_2d_count:.1f})...")
+        QApplication.processEvents()
+
+        # Original (config) tolerances. obj_cfg._sm_param is mutated below for
+        # this frame's retry attempts only, then restored - obj_cfg is shared
+        # across frames in the outer loop and nothing here is persisted to disk.
+        orig_tol_2d = obj_cfg._sm_param.tol_2d_px
+        orig_tol_3d_mm = obj_cfg._sm_param.tol_3d_mm
+
+        def try_bubble_ref(obj3d_list):
+            """True if calBubbleRefImg's 3 gates pass for these matched 3D
+            objects (Bubble only; Tracer has no reference-image concept).
+            output_folder="" so nothing is written to disk - this is a
+            pure check, calBubbleRefImg throws RuntimeError on failure."""
+            if obj_type != "Bubble":
+                return False
+            try:
+                ref_img = lpt.BubbleRefImg()
+                ref_img.calBubbleRefImg(
+                    list(obj3d_list), obj2d_list, camera_models, image_list,
+                    "", 6.0, 5,
+                )
+                return True
+            except RuntimeError:
+                return False
+            except Exception as exc:
+                print(f"[Validation] Frame {frame_id}: calBubbleRefImg check raised {type(exc).__name__}: {exc}")
+                return False
+
+        try:
+            stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
+            obj3d_list = stereomath.match()
+            count_3d = len(obj3d_list)
+            print(f"[Validation] Frame {frame_id} Initial Match: found {count_3d} 3D objects.")
+            ref_ok = try_bubble_ref(obj3d_list) if count_3d > 5 else False
+
+            current_tol_2d = orig_tol_2d
+            max_tol_2d_increase = 5.0
+            tol_2d_step = 0.5
+
+            while (not ref_ok) and count_3d < (avg_2d_count / 4.0) and (current_tol_2d - orig_tol_2d) < max_tol_2d_increase:
+                if progress.wasCanceled():
+                    result["canceled"] = True
+                    break
+
+                current_tol_2d += tol_2d_step
+                obj_cfg._sm_param.tol_2d_px = current_tol_2d
+
+                progress.setLabelText(f"Stage 1 (2D Tol): Matching 3D frame {frame_id} (tol={current_tol_2d:.2f})...")
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    result["canceled"] = True
+                    break
+
+                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
+                obj3d_list = stereomath.match()
+                count_3d = len(obj3d_list)
+                print(f"[Validation] Frame {frame_id} Retry Match (2D tol={current_tol_2d:.2f}): found {count_3d} 3D objects.")
+                ref_ok = try_bubble_ref(obj3d_list) if count_3d > 5 else False
+                QApplication.processEvents()
+
+            current_tol_3d_mm = orig_tol_3d_mm
+            max_tol_3d_increase_mm = 1.0
+            tol_3d_step_mm = 0.2
+
+            while (not ref_ok) and (not result["canceled"]) and count_3d < (avg_2d_count / 4.0) and (current_tol_3d_mm - orig_tol_3d_mm) < max_tol_3d_increase_mm:
+                if progress.wasCanceled():
+                    result["canceled"] = True
+                    break
+
+                current_tol_3d_mm += tol_3d_step_mm
+                obj_cfg._sm_param.tol_3d_mm = current_tol_3d_mm
+
+                progress.setLabelText(f"Stage 2 (3D Tol): Matching 3D frame {frame_id} (tol={current_tol_3d_mm:.2f}mm)...")
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    result["canceled"] = True
+                    break
+
+                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
+                obj3d_list = stereomath.match()
+                count_3d = len(obj3d_list)
+                print(f"[Validation] Frame {frame_id} Retry Match (3D tol={current_tol_3d_mm:.2f}mm): found {count_3d} 3D objects.")
+                ref_ok = try_bubble_ref(obj3d_list) if count_3d > 5 else False
+                QApplication.processEvents()
+
+            # Last attempt: if matching ended with count_3d > 5 at the final
+            # tolerances but ref_ok wasn't (re)checked at this exact state,
+            # try once more before giving up on this frame.
+            if not ref_ok and count_3d > 5:
+                ref_ok = try_bubble_ref(obj3d_list)
+
+            # Tracer has no bubble-reference concept - fall back to the
+            # proportional match-quality proxy so Tracer validation still
+            # reports a meaningful pass/fail.
+            if obj_type != "Bubble":
+                ref_ok = count_3d >= (avg_2d_count / 4.0)
+
+            result["passed"] = bool(ref_ok)
+            if result["passed"]:
+                result["tol_2d_px"] = current_tol_2d
+                result["tol_3d_mm"] = current_tol_3d_mm
+        finally:
+            # Restore obj_cfg's match params so the next frame's attempt
+            # starts from the config's original tolerances, not this
+            # frame's bumped values.
+            obj_cfg._sm_param.tol_2d_px = orig_tol_2d
+            obj_cfg._sm_param.tol_3d_mm = orig_tol_3d_mm
+
+        result["count_3d"] = count_3d
+        result["tol_2d_increase"] = current_tol_2d - orig_tol_2d
+        result["tol_3d_increase_mm"] = current_tol_3d_mm - orig_tol_3d_mm
+        return result
+
     def _validate_settings(self):
-        """Validate current settings by running 2D detection and 3D matching on the configured start frame."""
-        from PySide6.QtWidgets import QProgressDialog, QApplication
-        from PySide6.QtCore import Qt
+        """Validate current settings (does NOT write config.txt/[type]Config.txt
+        to the project): run 2D detection + 3D matching + the bubble-
+        reference-image check (calBubbleRefImg's 3 gates - same as the
+        tracking binary's IPR.cpp/BubbleRefImg.cpp, unmodified).
+
+        Builds camera models / image lists / object config from the CURRENT
+        UI state by rendering config.txt/[type]Config.txt CONTENTS in-memory
+        (_render_config_files, path_mode="absolute") and writing them to a
+        TEMPORARY directory only - lpt.BasicSetting.readConfig() requires an
+        actual file on disk, but the real project's config.txt/
+        bubbleConfig.txt are never read or written by this method. The temp
+        directory is deleted before returning.
+
+        Scans frame_start..frame_end (from the UI spinboxes) until a frame's
+        matched 3D objects pass calBubbleRefImg, and reports that frame.
+
+        Does NOT change frame_start/frame_end. If a passing frame needed
+        relaxed IPR 2D/3D tolerances, this DOES update the '2D tolerance'/
+        '3D tolerance' widgets to those values (visibly) - clicking "Save
+        Configuration" afterwards writes config.txt with the user's
+        Frame Start/End untouched and bubbleConfig.txt with these validated
+        tolerances.
+        """
+        import shutil
+        import tempfile
+        from PySide6.QtWidgets import QApplication
         self._busy_begin('validate_settings', 'Validating tracking settings')
-        
-        # 1. Save configuration first to ensure files are up to date
-        self._save_configuration()
-        
+
         project_dir = self.project_path.text().strip()
         if not project_dir or " (" in project_dir:
             project_dir = project_dir.split(" (")[0]
-            
-        config_file = os.path.join(project_dir, "config.txt").replace('\\', '/')
-        if not os.path.exists(config_file):
-            QMessageBox.warning(self, "Error", "Config file not found. Please save configuration first.")
+        if not project_dir or not os.path.isdir(project_dir):
+            QMessageBox.warning(self, "Invalid Path", "Please select a valid Project Directory first.")
+            self._busy_end('validate_settings')
             return
+        project_dir = os.path.abspath(project_dir)
 
-        # Setup Progress Dialog
-        progress = QProgressDialog("Verifying Settings...", "Cancel", 0, 0, self)
-        progress.setWindowTitle("Please Wait")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setStyleSheet("""
-            QProgressDialog { background-color: #2b2b2b; color: #ffffff; padding: 15px; border: 1px solid #444; }
-            QLabel { color: #ffffff; font-size: 13px; font-weight: bold; background-color: transparent; }
-            QProgressBar { 
-                min-height: 12px; max-height: 12px; margin: 10px 15px; 
-                background-color: #444; border-radius: 4px; text-align: center; color: white;
-            }
-            QProgressBar::chunk { background-color: #00bcd4; border-radius: 4px; }
-        """)
+        progress = _ValidationStatusDialog(self)
+        progress.setLabelText("Verifying Settings...")
         progress.show()
         QApplication.processEvents()
 
+        temp_dir = None
         try:
             import pyopenlpt as lpt
-            
+
+            progress.setLabelText("Preparing configuration...")
+            QApplication.processEvents()
+
+            # Render config.txt/[type]Config.txt from CURRENT UI state, with
+            # camFile/imgFile/output paths written as ABSOLUTE paths into the
+            # real project directory (so they resolve correctly even though
+            # config.txt itself lives in a temp dir). Written to a temp dir,
+            # read via BasicSetting.readConfig(), then deleted - the real
+            # project's config.txt/bubbleConfig.txt are never touched.
+            master_config_text, stb_config_text, stb_config_name = self._render_config_files(
+                project_dir, path_mode="absolute"
+            )
+
+            temp_dir = tempfile.mkdtemp(prefix="hz_validate_")
+            temp_config_path = os.path.join(temp_dir, "config.txt")
+            temp_stb_path = os.path.join(temp_dir, stb_config_name)
+            with open(temp_config_path, 'w') as f:
+                f.write(master_config_text)
+            with open(temp_stb_path, 'w') as f:
+                f.write(stb_config_text)
+
             progress.setLabelText("Loading Configuration...")
             QApplication.processEvents()
-            
-            # Load basic settings
+
             basic_settings = lpt.BasicSetting()
-            basic_settings.readConfig(config_file)
+            basic_settings.readConfig(temp_config_path.replace('\\', '/'))
             camera_models = basic_settings._cam_list
-            
-            # Select correct config object
+
             obj_type = self.obj_type_combo.currentText()
             if obj_type == "Tracer":
                 obj_cfg = lpt.TracerConfig()
             else:
                 obj_cfg = lpt.BubbleConfig()
-            
-            # Read object specific config
+
             if not basic_settings._object_config_paths:
                 progress.close()
                 QMessageBox.warning(self, "Error", "Object configuration path missing in basic settings.")
                 return
-            
+
             obj_cfg.readConfig(basic_settings._object_config_paths[0], basic_settings)
-            
+
             progress.setLabelText("Loading Images...")
             QApplication.processEvents()
-            
-            # Load images for the configured start frame.
+
             imgio_list = []
-            folder_base = os.path.abspath(project_dir).replace('\\', '/') + '/'
+            folder_base = project_dir.replace('\\', '/') + '/'
             for path in basic_settings._image_file_paths:
                 io = lpt.ImageIO()
                 io.loadImgPath(folder_base, path)
                 imgio_list.append(io)
-                
+
             num_cams = len(imgio_list)
-            frame_id = int(getattr(basic_settings, '_frame_start', 0))
-            image_list = []
-            progress.setLabelText(f"Loading Images (frame {frame_id})...")
-            QApplication.processEvents()
-            for i in range(num_cams):
-                image_list.append(imgio_list[i].loadImg(frame_id))
-                
-            progress.setLabelText(f"Detecting 2D Objects (frame {frame_id})...")
-            QApplication.processEvents()
-            
-            # Detect 2D objects
-            obj_finder = lpt.ObjectFinder2D()
-            obj2d_list = []
-            total_2d_count = 0
-            per_camera_2d_counts = []
-            for cam_id in range(num_cams):
-                obj2ds = obj_finder.findObject2D(image_list[cam_id], obj_cfg)
-                obj2d_list.append(obj2ds)
-                count = len(obj2ds)
-                per_camera_2d_counts.append(count)
-                total_2d_count += count
-                print(f"[Validation] Frame {frame_id}, Camera {cam_id}: found {count} 2D objects.")
-                 
-            avg_2d_count = total_2d_count / num_cams if num_cams > 0 else 0
-            camera_count_summary = ", ".join(
-                f"Cam {cam_id}: {count}" for cam_id, count in enumerate(per_camera_2d_counts)
-            ) or "No cameras"
-            zero_camera_ids = [cam_id for cam_id, count in enumerate(per_camera_2d_counts) if count == 0]
-            zero_camera_warning = ""
-            if zero_camera_ids:
-                zero_camera_warning = (
-                    "\n\nWarning: no 2D objects were detected in camera(s): "
-                    + ", ".join(str(cam_id) for cam_id in zero_camera_ids)
-                    + "."
+            frame_start = int(self.frame_start_spin.value())
+            frame_end = int(self.frame_end_spin.value())
+
+            config_note = ""
+
+
+            last_result = None
+            for frame_id in range(frame_start, frame_end + 1):
+                if progress.wasCanceled():
+                    break
+
+                last_result = self._run_validation_on_frame(
+                    lpt, camera_models, obj_cfg, imgio_list, frame_id, progress, num_cams, obj_type
                 )
 
-            if total_2d_count == 0:
-                progress.close()
-                error_msg = f"Validation failed for frame {frame_id}.\n\n" \
-                            "No 2D objects were detected in any camera, so 3D matching cannot proceed.\n\n" \
-                            f"Per-camera 2D counts: {camera_count_summary}\n\n" \
-                            "Check image paths, frame range, object detection thresholds, and image preprocessing settings."
-                print(f"[Validation] Frame {frame_id}: no 2D objects detected in any camera.")
-                QMessageBox.warning(self, "Validation Failed", error_msg)
-                return
-             
-            progress.setLabelText(f"Matching 3D Objects (frame {frame_id}, 2D Avg: {avg_2d_count:.1f})...")
-            QApplication.processEvents()
-            
-            # Initial 3D match
-            stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
-            obj3d_list = stereomath.match()
-            count_3d = len(obj3d_list)
-            print(f"[Validation] Frame {frame_id} Initial Match: found {count_3d} 3D objects.")
-            
-            # Step 1: Iterative 2D tolerance increase if 3D count is too low (< 25% of avg 2D)
-            orig_tol_2d = obj_cfg._sm_param.tol_2d_px
-            current_tol_2d = orig_tol_2d
-            max_tol_2d_increase = 5.0
-            tol_2d_step = 0.5
-            modified_2d = False
-            
-            while count_3d < (avg_2d_count / 4.0) and (current_tol_2d - orig_tol_2d) < max_tol_2d_increase:
-                current_tol_2d += tol_2d_step
-                obj_cfg._sm_param.tol_2d_px = current_tol_2d
-                
-                progress.setLabelText(f"Stage 1 (2D Tol): Matching 3D frame {frame_id} (tol={current_tol_2d:.2f})...")
-                if progress.wasCanceled(): break
-                QApplication.processEvents()
-                
-                # Retry matching
-                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
-                obj3d_list = stereomath.match()
-                count_3d = len(obj3d_list)
-                modified_2d = True
-                print(f"[Validation] Frame {frame_id} Retry Match (2D tol={current_tol_2d:.2f}): found {count_3d} 3D objects.")
+                if last_result["canceled"]:
+                    break
 
-            # Step 2: Iterative 3D tolerance increase if still insufficient
-            orig_tol_3d_mm = obj_cfg._sm_param.tol_3d_mm
-            current_tol_3d_mm = orig_tol_3d_mm
-            max_tol_3d_increase_mm = 1.0
-            tol_3d_step_mm = 0.2
-            modified_3d = False
+                if last_result["no_2d"]:
+                    # No 2D objects at all is a per-frame data issue (e.g.
+                    # an empty/black frame) - keep scanning forward, same as
+                    # the bubble-reference-image search.
+                    continue
 
-            while count_3d < (avg_2d_count / 4.0) and (current_tol_3d_mm - orig_tol_3d_mm) < max_tol_3d_increase_mm:
-                current_tol_3d_mm += tol_3d_step_mm
-                obj_cfg._sm_param.tol_3d_mm = current_tol_3d_mm
-                
-                progress.setLabelText(f"Stage 2 (3D Tol): Matching 3D frame {frame_id} (tol={current_tol_3d_mm:.2f}mm)...")
-                if progress.wasCanceled(): break
-                QApplication.processEvents()
-                
-                # Retry matching
-                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
-                obj3d_list = stereomath.match()
-                count_3d = len(obj3d_list)
-                modified_3d = True
-                print(f"[Validation] Frame {frame_id} Retry Match (3D tol={current_tol_3d_mm:.2f}mm): found {count_3d} 3D objects.")
-            
+                if last_result["passed"]:
+                    break
+
             progress.close()
-            
-            # Check final result
-            if count_3d < (avg_2d_count / 4.0):
-                error_msg = f"Validation failed for frame {frame_id}.\n\n" \
-                            f"Even with 2D tolerance increased by {current_tol_2d - orig_tol_2d:.1f}px " \
-                            f"and 3D tolerance increased by {current_tol_3d_mm - orig_tol_3d_mm:.1f}mm, " \
-                            f"only {count_3d} 3D objects were reconstructed from ~{avg_2d_count:.1f} 2D objects.\n\n" \
-                            f"Per-camera 2D counts: {camera_count_summary}" \
-                            f"{zero_camera_warning}\n\n" \
-                            "The current camera parameters may be inaccurate or invalid for tracking."
+
+            if last_result is None:
+                QMessageBox.warning(self, "Validation Failed", "No frames were checked (range is empty or canceled immediately).")
+                return
+
+            if last_result["canceled"]:
+                QMessageBox.information(
+                    self, "Validation Stopped",
+                    f"Validation stopped at frame {last_result['frame_id']} "
+                    f"(scanned {frame_start}..{last_result['frame_id']})."
+                    f"{config_note}"
+                )
+                return
+
+            frame_id = last_result["frame_id"]
+            camera_count_summary = last_result["camera_count_summary"]
+            zero_camera_warning = last_result["zero_camera_warning"]
+            avg_2d_count = last_result["avg_2d_count"]
+            count_3d = last_result["count_3d"]
+
+            if not last_result["passed"]:
+                if last_result["no_2d"]:
+                    error_msg = (
+                        f"Validation failed.\n\n"
+                        f"Scanned frames {frame_start}..{frame_id} and found no 2D objects in any camera "
+                        f"on any of them.\n\n"
+                        f"Per-camera 2D counts (frame {frame_id}): {camera_count_summary}\n\n"
+                        "Check image paths, frame range, object detection thresholds, and image preprocessing settings."
+                        f"{config_note}"
+                    )
+                else:
+                    tol_2d_inc = last_result["tol_2d_increase"]
+                    tol_3d_inc = last_result["tol_3d_increase_mm"]
+                    scanned_note = (
+                        f"Scanned frames {frame_start}..{frame_id} ({frame_id - frame_start + 1} frame(s)); "
+                        f"none had enough bubbles to build a bubble reference image.\n\n"
+                    ) if frame_id != frame_start else ""
+                    bubble_note = (
+                        "The bubble reference image needs >5 bubbles that are well-resolved "
+                        "(radius>6px in EVERY camera, pass an intensity-peak filter, and have enough "
+                        "per-pixel overlap) - this is stricter than just '3D objects found'.\n\n"
+                    ) if obj_type == "Bubble" else ""
+                    error_msg = (
+                        f"Validation failed for frame {frame_id}.\n\n"
+                        f"{scanned_note}"
+                        f"{bubble_note}"
+                        f"Even with 2D tolerance increased by {tol_2d_inc:.1f}px "
+                        f"and 3D tolerance increased by {tol_3d_inc:.1f}mm, "
+                        f"only {count_3d} 3D objects were reconstructed from ~{avg_2d_count:.1f} 2D objects.\n\n"
+                        f"Per-camera 2D counts (frame {frame_id}): {camera_count_summary}"
+                        f"{zero_camera_warning}\n\n"
+                        "This usually means the camera parameters (camFile/cam*.txt) are inaccurate or do not "
+                        "match this dataset - check calibration before re-running."
+                        f"{config_note}"
+                    )
                 QMessageBox.warning(self, "Validation Failed", error_msg)
             else:
-                if modified_2d or modified_3d:
-                    # Update UI
-                    if modified_2d:
-                        self.ipr_2d_tol.setValue(current_tol_2d)
-                    if modified_3d:
-                        # Convert adjusted 3D mm back to voxel units for the UI
-                        v_scale = self.voxel_spin.value()
-                        new_3d_vox = current_tol_3d_mm / v_scale if v_scale > 0 else current_tol_3d_mm
-                        self.ipr_3d_tol.setValue(new_3d_vox)
-                        
-                    # Regenerate config files with new settings
-                    self._save_configuration()
-                    
+                tol_2d_inc = last_result["tol_2d_increase"]
+                tol_3d_inc = last_result["tol_3d_increase_mm"]
+                tol_2d_px = last_result["tol_2d_px"]
+                tol_3d_mm = last_result["tol_3d_mm"]
+
+                adjust_note = ""
+                if obj_type == "Bubble" and (tol_2d_inc > 0 or tol_3d_inc > 0):
+                    # Update the IPR tolerance widget(s) that ACTUALLY changed
+                    # to make this frame's bubble reference image succeed.
+                    # config.txt's Frame Start/End are NOT touched - only
+                    # these widgets, which Save Configuration writes into
+                    # bubbleConfig.txt.
                     adjust_info = []
-                    if modified_2d: adjust_info.append(f"2D tolerance -> {current_tol_2d:.2f}px")
-                    if modified_3d: adjust_info.append(f"3D tolerance -> {current_tol_3d_mm:.2f}mm")
-                    
-                    msg = f"Validation successful with adjustment!\n\n" \
-                          f"Validated Frame: {frame_id}\n" \
-                          f"Adjustments: {', '.join(adjust_info)}\n" \
-                          f"3D Objects: {count_3d}\n" \
-                          f"Average 2D Objects: {avg_2d_count:.1f}\n" \
-                          f"Per-camera 2D counts: {camera_count_summary}" \
-                          f"{zero_camera_warning}"
-                else:
-                    msg = f"Validation Successful!\n\n" \
-                          f"Validated Frame: {frame_id}\n" \
-                          f"3D Objects: {count_3d}\n" \
-                          f"Average 2D Objects: {avg_2d_count:.1f}\n" \
-                          f"Per-camera 2D counts: {camera_count_summary}" \
-                          f"{zero_camera_warning}"
-                
+                    if tol_2d_inc > 0:
+                        self.ipr_2d_tol.setValue(round(tol_2d_px, 4))
+                        adjust_info.append(f"2D tolerance -> {tol_2d_px:.2f}px")
+                    if tol_3d_inc > 0:
+                        voxel_to_mm = self.voxel_spin.value()
+                        if voxel_to_mm > 0:
+                            self.ipr_3d_tol.setValue(round(tol_3d_mm / voxel_to_mm, 4))
+                        adjust_info.append(f"3D tolerance -> {tol_3d_mm:.2f}mm")
+                    adjust_note = (
+                        "\n\nThe '2D tolerance' / '3D tolerance' fields above have been updated to the "
+                        "values that made frame " + str(frame_id) + "'s bubble reference image succeed ("
+                        + ", ".join(adjust_info)
+                        + "). Click 'Save Configuration' to write these into bubbleConfig.txt - "
+                          "Frame Start/Frame End are unchanged."
+                    )
+
+                frame_note = ""
+                if frame_id != frame_start:
+                    frame_note = (
+                        f"\n\nNote: frame_start ({frame_start}) did not have enough bubbles for a bubble "
+                        f"reference image; validation continued scanning forward and frame {frame_id} "
+                        f"passed.\n\n"
+                        f"Frame Start/Frame End are UNCHANGED (still [{frame_start}, {frame_end}]) - "
+                        f"that's just where tracking will start/stop. The bubble reference image used by "
+                        f"the tracking binary will be built from frame {frame_start} at runtime as before; "
+                        f"this validation only confirms frame {frame_id}'s data CAN produce a valid bubble "
+                        f"reference image with the tolerances above (now applied via Save Configuration)."
+                    )
+
+                pass_label = (
+                    "Validation Successful! Bubble reference image OK."
+                    if obj_type == "Bubble" else
+                    "Validation Successful!"
+                )
+
+                msg = (
+                    f"{pass_label}\n\n"
+                    f"Validated Frame: {frame_id}\n"
+                    f"3D Objects: {count_3d}\n"
+                    f"Average 2D Objects: {avg_2d_count:.1f}\n"
+                    f"Per-camera 2D counts: {camera_count_summary}"
+                    f"{zero_camera_warning}"
+                    f"{frame_note}"
+                    f"{adjust_note}"
+                    f"{config_note}"
+                )
                 QMessageBox.information(self, "Validation Result", msg)
 
         except ImportError:
@@ -1744,4 +2212,7 @@ class TrackingSettingsView(QWidget):
             progress.close()
             QMessageBox.critical(self, "Validation Error", f"An error occurred during validation:\n{str(e)}")
         finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
             self._busy_end('validate_settings')
+

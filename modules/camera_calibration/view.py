@@ -1775,6 +1775,20 @@ class CameraCalibrationView(QWidget):
 
         
         error_header_row.addStretch()
+
+        # HZ_fix: pop up an Error Matrix window (per-camera stats + full matrix).
+        self.btn_error_matrix = QPushButton("Error Matrix")
+        self.btn_error_matrix.setStyleSheet(
+            "background-color:#2a3f5f; color:white; font-size:11px; "
+            "padding:4px 10px; border-radius:4px;"
+        )
+        self.btn_error_matrix.setToolTip(
+            "Open a window with per-camera error stats (mean, median, tail %) and "
+            "the full frame x camera error matrix."
+        )
+        self.btn_error_matrix.clicked.connect(self._show_error_matrix)
+        error_header_row.addWidget(self.btn_error_matrix)
+
         cal_layout.addLayout(error_header_row)
         
         # Error Table with horizontal scroll and sorting
@@ -6523,7 +6537,177 @@ class CameraCalibrationView(QWidget):
         # (repopulating data doesn't trigger sortIndicatorChanged signal)
         header = self.error_table.horizontalHeader()
         self._sync_frozen_table_sort(header.sortIndicatorSection(), header.sortIndicatorOrder())
-    
+
+    def _show_error_matrix(self, checked=False):
+        """HZ_fix: Pop up an Error Matrix window.
+
+        Top: per-camera projection-error stats — Mean, Median, a user-set Tail
+        percentile, and Max (plus an 'All cams' row and a wand-length summary).
+        Bottom: the full frame x camera error matrix (sortable, read-only).
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
+            QTableWidgetItem, QDoubleSpinBox, QPushButton,
+        )
+        import numpy as np
+
+        if not hasattr(self, 'wand_calibrator'):
+            QMessageBox.information(self, "Error Matrix", "Run a calibration first.")
+            return
+        errors = self.wand_calibrator.calculate_per_frame_errors()
+        if not errors:
+            QMessageBox.information(
+                self, "Error Matrix",
+                "No error data yet. Run 'Run Calibration' or 'Precalibrate to Check' first."
+            )
+            return
+
+        cam_ids = sorted({c for e in errors.values() for c in e['cam_errors'].keys()})
+        frame_ids = sorted(errors.keys())
+
+        # Collect per-camera projection-error distributions and wand-length errors.
+        per_cam = {c: [] for c in cam_ids}
+        len_errs = []
+        for fid in frame_ids:
+            e = errors[fid]
+            for c in cam_ids:
+                v = e['cam_errors'].get(c)
+                if v is not None and not np.isnan(v):
+                    per_cam[c].append(float(v))
+            le = e.get('len_error')
+            if le is not None and not np.isnan(le):
+                len_errs.append(float(le))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Error Matrix")
+        dlg.setMinimumSize(740, 580)
+        dlg.setStyleSheet("background-color:#0d1117; color:#e6e6e6;")
+        layout = QVBoxLayout(dlg)
+
+        # --- Top: tail % control + per-camera summary ---
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Per-Camera Error Stats (px)"))
+        ctrl.addStretch()
+        ctrl.addWidget(QLabel("Tail %:"))
+        tail_spin = QDoubleSpinBox()
+        tail_spin.setRange(0.1, 50.0)
+        tail_spin.setSingleStep(1.0)
+        tail_spin.setValue(5.0)
+        tail_spin.setSuffix(" %")
+        tail_spin.setStyleSheet("background:#161b22; color:#fff; padding:2px 4px;")
+        tail_spin.setToolTip(
+            "Tail percentile: the projection error exceeded by the worst p% of "
+            "frames (i.e. the (100 - p)th percentile)."
+        )
+        ctrl.addWidget(tail_spin)
+        layout.addLayout(ctrl)
+
+        table_style = (
+            "QTableWidget{background:#161b22; gridline-color:#30363d;} "
+            "QHeaderView::section{background:#21262d; color:#fff; border:0; padding:3px;}"
+        )
+
+        summary = QTableWidget()
+        summary.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        summary.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        summary.verticalHeader().setVisible(False)
+        summary.setStyleSheet(table_style)
+        summary.setMaximumHeight(200)
+        layout.addWidget(summary)
+
+        len_label = QLabel("")
+        len_label.setStyleSheet("color:#9aa7b3; font-size:11px;")
+        layout.addWidget(len_label)
+
+        def _stats(vals, p):
+            arr = np.asarray(vals, dtype=float)
+            if arr.size == 0:
+                return None
+            return {
+                "n": arr.size,
+                "mean": float(arr.mean()),
+                "median": float(np.median(arr)),
+                "tail": float(np.percentile(arr, 100.0 - p)),
+                "max": float(arr.max()),
+            }
+
+        def fill_summary():
+            p = tail_spin.value()
+            cols = ["Camera", "N", "Mean", "Median", f"Tail {p:g}%", "Max"]
+            rows = [(f"Cam {c + 1}", per_cam[c]) for c in cam_ids]
+            rows.append(("All cams", [v for c in cam_ids for v in per_cam[c]]))
+            summary.setColumnCount(len(cols))
+            summary.setHorizontalHeaderLabels(cols)
+            summary.setRowCount(len(rows))
+            for r, (label, vals) in enumerate(rows):
+                st = _stats(vals, p)
+                if st is None:
+                    cells = [label, "0", "-", "-", "-", "-"]
+                else:
+                    cells = [label, str(st["n"]), f"{st['mean']:.3f}",
+                             f"{st['median']:.3f}", f"{st['tail']:.3f}", f"{st['max']:.3f}"]
+                for cidx, txt in enumerate(cells):
+                    item = QTableWidgetItem(txt)
+                    if cidx == 0 and label == "All cams":
+                        item.setForeground(Qt.GlobalColor.cyan)
+                    summary.setItem(r, cidx, item)
+            summary.resizeColumnsToContents()
+            summary.horizontalHeader().setStretchLastSection(True)
+            le = _stats(len_errs, p)
+            if le is None:
+                len_label.setText("Wand length error: n/a")
+            else:
+                len_label.setText(
+                    f"Wand length error (mm) — mean {le['mean']:.3f}, "
+                    f"median {le['median']:.3f}, tail {p:g}% {le['tail']:.3f}, "
+                    f"max {le['max']:.3f}"
+                )
+
+        tail_spin.valueChanged.connect(lambda _v: fill_summary())
+        fill_summary()
+
+        # --- Bottom: full frame x camera matrix ---
+        layout.addWidget(QLabel("Error Matrix (per-frame projection error px; Len Err mm)"))
+        matrix = QTableWidget()
+        matrix.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        matrix.verticalHeader().setVisible(False)
+        matrix.setStyleSheet(table_style)
+        matrix.setSortingEnabled(False)
+        headers = ["Frame"] + [f"Cam {c + 1}" for c in cam_ids] + ["Len Err (mm)"]
+        matrix.setColumnCount(len(headers))
+        matrix.setHorizontalHeaderLabels(headers)
+        matrix.setRowCount(len(frame_ids))
+        proj_thr = self.filter_proj_spin.value() if hasattr(self, 'filter_proj_spin') else float('inf')
+        len_thr = self.filter_len_spin.value() if hasattr(self, 'filter_len_spin') else float('inf')
+        for row, fid in enumerate(frame_ids):
+            e = errors[fid]
+            matrix.setItem(row, 0, NumericTableWidgetItem(str(fid)))
+            for i, c in enumerate(cam_ids):
+                v = e['cam_errors'].get(c, float('nan'))
+                it = NumericTableWidgetItem("nan" if np.isnan(v) else f"{v:.2f}")
+                if not np.isnan(v) and v > proj_thr:
+                    it.setBackground(Qt.GlobalColor.darkRed)
+                matrix.setItem(row, i + 1, it)
+            le = e.get('len_error', float('nan'))
+            it = NumericTableWidgetItem("nan" if np.isnan(le) else f"{le:.3f}")
+            if not np.isnan(le) and le > len_thr:
+                it.setBackground(Qt.GlobalColor.darkRed)
+            matrix.setItem(row, len(cam_ids) + 1, it)
+        matrix.setSortingEnabled(True)
+        matrix.resizeColumnsToContents()
+        layout.addWidget(matrix, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("background:#2a3f5f; color:white; padding:5px 18px; border-radius:4px;")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._error_matrix_dialog = dlg  # keep a reference so it isn't GC'd
+        dlg.show()
+
     def _sync_frozen_table_sort(self, logical_index, order):
         """Handle sort request by manually sorting and repopulating BOTH tables."""
         from PySide6.QtWidgets import QCheckBox, QWidget, QHBoxLayout

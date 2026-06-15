@@ -17,6 +17,22 @@ workflow conveniences only.
   CLI equivalent of "Process All Frames".
 - `modules/camera_calibration/wand_calibration/wand_calibration_cli.py` — **new**:
   CLI equivalent of "Run Calibration" (pinhole **and** Pinhole+Refraction).
+- `modules/image_preprocessing/cli.py` — fixed camera-ID convention (now
+  0-based, matching the calibration/tracking convention everywhere else).
+- `modules/image_preprocessing/runner.py` — fixed image-list filename to
+  `cam<N>ImageNames.txt` (matches what the tracking page actually reads).
+- `cli_tracking_settings.py` — **new**: CLI equivalent of the Settings page's
+  "Save Configuration" (writes `config.txt` + `bubbleConfig.txt`/
+  `tracerConfig.txt`).
+- `modules/image_preprocessing/reference_frame.py` — **new**: block-based
+  coarse-to-fine search for a valid bubble *reference frame* (validation injected,
+  never modified).
+- `modules/image_preprocessing/cli.py` — added `find_reference_frame_from_detected`
+  (wires the search to the frames `_build_tasks_from_input_root` enumerates).
+- `tests/test_image_preprocessing_cli.py`,
+  `tests/test_image_preprocessing_io.py` — updated expected filenames/camera
+  IDs for the above fix.
+- `tests/test_reference_frame_search.py` — **new**: tests for the search.
 
 ### `modules/camera_calibration/view.py`
 **Changed:**
@@ -46,6 +62,8 @@ workflow conveniences only.
   `_import_cal_config()` — Cal-page config import/export.
 - `_browse_wand_output_path()` — pick the detection-results CSV for the new
   "Output Path" section (Change 7).
+- `_show_error_matrix()` — "Error Matrix" popup (per-camera mean/median/tail-%
+  stats + full frame x camera matrix), Change 13.
 
 ### `modules/camera_calibration/widgets.py`
 - `SimpleSlider.__init__` — replaced the read-only label with an editable
@@ -561,3 +579,496 @@ Headless (`QT_QPA_PLATFORM=offscreen`, `OpenLPT` conda env): the view builds wit
 the new `wand_output_path_edit` / `btn_browse_output` widgets, `Import Config`
 remains at the top, `Export Config` is present above Load Wand Points, and
 `view.py` compiles clean (`py_compile`).
+
+---
+
+## 8. Image Preprocessing CLI — fixed camera-ID convention and output naming
+
+**Date:** 2026-06-13
+**Files:**
+- `modules/image_preprocessing/cli.py`
+- `modules/image_preprocessing/runner.py`
+- `modules/image_preprocessing/view.py`
+- `tests/test_image_preprocessing_cli.py`, `tests/test_image_preprocessing_io.py`
+
+### Problem
+
+The `openlpt preprocess` CLI used **1-based** camera indices everywhere
+(`enumerate(..., start=1)`), so `--input-root` with `cam0/cam1/cam2/cam3`
+subfolders produced output folders `cam1/cam2/cam3/cam4` — off by one from
+both the input folder names and the 0-based camera IDs used by Wand
+Calibration (`cam0.txt`..`cam3.txt`) and the Tracking page (`cam0`..`cam3`).
+
+The CLI also wrote per-camera image lists as `cam<N>_image_list.txt`, but
+`gui/views/tracking_settings_view.py` and `gui/views/tracking_view.py` only
+ever look for `cam<N>ImageNames.txt` (this is what `config.txt`'s "# Image
+File Path" section references, and what the GUI's own
+`_write_image_name_files()` in `modules/image_preprocessing/view.py` writes).
+So a CLI-produced dataset could not be picked up by Tracking without a manual
+rename.
+
+### Fix
+
+- **`runner.py`**: `image_list_path = output_dir / f"cam{cam_idx}_image_list.txt"`
+  → `f"cam{cam_idx}ImageNames.txt"`. This is the only place the filename is
+  decided; `cli.py`'s summary printout (`_print_summary`) needed no change.
+- **`cli.py`**: every `enumerate(..., start=1)` that assigns a camera index
+  (`--input-root`, `--input-list`, `--image`, `--cine`, and the matching
+  `_build_backgrounds` branches) is now `enumerate(..., start=0)`.
+  `--camera-index` is now validated as `>= 0` (was `>= 1`) and documented as
+  0-based. Help text/epilog examples updated to `cam0`/`cam1` (was
+  `cam1`/`cam2`).
+- **`view.py`** (`_build_preprocess_cli_command`, the GUI's "Generate CLI"
+  button for Preprocessing): removed the `cam_idx + 1` translation that had
+  been compensating for the CLI's old 1-based convention (and the
+  accompanying note about "GUI camera tabs are zero-based; the CLI maps them
+  to one-based..."). The generated `--camera-index` and `--input-list
+  /path/to/cam<N>ImageNames.txt` placeholders now use the same `cam_idx` as
+  the GUI's own camera tabs.
+- **Tests**: `cam1_image_list.txt` → `cam1ImageNames.txt` (filename-only
+  changes, where `--camera-index 1` was explicitly passed so `cam1` itself is
+  correct); the `--input-root` auto-detection test now expects 0-based
+  `cam_idx` values `[0, 0, 1, 1]` (was `[1, 1, 2, 2]`) and
+  `cam0ImageNames.txt`/`cam1ImageNames.txt`.
+
+### Net effect
+
+`python -m modules.image_preprocessing.cli --input-root <root>` where `<root>`
+contains `cam0/`, `cam1/`, `cam2/`, `cam3/` now produces:
+
+```
+<root>/imgFile/
+├── cam0/...            cam0ImageNames.txt
+├── cam1/...            cam1ImageNames.txt
+├── cam2/...            cam2ImageNames.txt
+└── cam3/...            cam3ImageNames.txt
+```
+
+— matching folder names, image-list filenames, and camera IDs throughout
+Preprocessing → Tracking → Calibration, regardless of input order, with no
+renaming step.
+
+### Verification
+
+`pytest tests/test_image_preprocessing_cli.py tests/test_image_preprocessing_core.py
+tests/test_image_preprocessing_io.py` → 21 passed. Also ran the CLI end-to-end
+on a synthetic `cam0..cam3` root: output folders and `cam<N>ImageNames.txt`
+files are 0-based and match the input folder names exactly.
+
+---
+
+## 9. `cli_tracking_settings.py` — headless "Save Configuration" for the Settings page
+
+**Date:** 2026-06-13
+**File:** `cli_tracking_settings.py` (new, repo root)
+
+### What it does
+
+Writes `config.txt` + `bubbleConfig.txt`/`tracerConfig.txt` into a project
+directory — the same two files produced by clicking **"Save Configuration"**
+on the Tracking **Settings** page — without opening the GUI. Intended for
+SLURM/cluster pipelines: run it once (or every time) before the tracking
+binary, so settings don't need to be re-entered in the GUI per job.
+
+Defaults match the most common bubble-tracking setup, per request:
+
+```
+--fps 3000  --object-type bubble
+```
+
+### How it matches "Save Configuration"
+
+This is a thin driver, **not a reimplementation**. It headlessly instantiates
+the real `TrackingSettingsView` (`gui/views/tracking_settings_view.py`) under
+`QT_QPA_PLATFORM=offscreen`, sets `project_path` and calls the same
+`_update_paths()` the GUI calls — which auto-derives Number of Cameras (from
+`imgFile/` subfolder count), Frame End (from image count in the first camera
+folder), Image/Camera/Output paths, the View Volume and Voxel-to-mm (adaptive
+estimation from `camFile/cam<N>.txt`), and the IPR 2D/3D tolerances (from
+camera reprojection/triangulation error stats) — then applies any CLI
+overrides on top, and calls `_save_configuration()` directly. The written
+files are therefore identical to what the GUI would write for the same field
+values.
+
+`QMessageBox.warning/information/critical` are monkeypatched to no-ops so the
+headless run doesn't block on a dialog; status normally shown in a message box
+(e.g. "Camera Parameters Missing") is instead summarized on stdout.
+
+### Flags
+
+`project_dir` (positional) plus optional overrides for everything on the
+Settings page: `--object-type {bubble,tracer}`, `--fps`, `--n-cameras`,
+`--frame-start`, `--frame-end`, `--n-threads`, `--image-path`,
+`--camera-path`, `--output-path`, `--volume XMIN XMAX YMIN YMAX ZMIN ZMAX`,
+`--voxel-to-mm`, `--resume` / `--resume-frame`, IPR/Shake/STB/predictive-field
+overrides (`--ipr-2d-tol`, `--ipr-3d-tol`, `--ipr-loops`, `--ipr-reduce-cam`,
+`--ipr-reduced-loops`, `--shake-width`, `--shake-loops`,
+`--shake-ghost-thresh`, `--stb-initial-radius`, `--stb-initial-frames`,
+`--stb-avg-spacing`, `--pred-grid X Y Z`, `--pred-search-radius`), tracer-only
+(`--tracer-int-thresh`, `--tracer-radius`), and bubble-only
+(`--bubble-min-radius`, `--bubble-max-radius`, `--bubble-sensitivity`).
+`--dry-run` prints the resolved settings without writing any files.
+
+Overrides are applied **after** auto-detection, so an explicit flag always
+wins over the auto-derived value.
+
+### `--n-threads 0` ("use all available")
+
+`config.txt`'s "Number of Threads" field documents `0` as "use as many as
+possible" (`inc/libSTB/Config.h: _n_thread = 0`), but the GUI's
+`n_threads_spin` has range `1..128` and cannot represent `0`. When
+`--n-threads 0` is passed, the CLI writes the rest of `config.txt` via
+`_save_configuration()` as usual, then patches the "Number of Threads" line to
+`0` directly. Any other `--n-threads N` value is written normally via the
+spinbox.
+
+### Notes / guarantees
+
+- **No tracking-algorithm changes.** This only drives the existing Settings
+  widget through its existing setters and calls its existing save method.
+- Verified headless (`QT_QPA_PLATFORM=offscreen`):
+  - Defaults (`--fps 3000 --object-type bubble`, no other flags) on a 2-camera
+    project produce a `config.txt`/`bubbleConfig.txt` pair byte-identical in
+    structure to the GUI's output for the same field values.
+  - `--object-type tracer` writes `tracerConfig.txt` with the tracer-specific
+    Object Info block (`tracer_int_thresh`, `tracer_radius`).
+  - On a 4-camera project with real `camFile/cam0..3.txt` calibration outputs,
+    Number of Cameras, Frame End, View Volume, Voxel-to-mm, and IPR 2D/3D
+    tolerances are all auto-derived exactly as `_update_paths()` /
+    `_on_cam_path_changed()` would compute them in the GUI.
+  - `--n-threads 0` and `--n-threads 24` both round-trip correctly into
+    `config.txt`.
+  - `--dry-run` prints the resolved configuration and writes nothing.
+
+### Example SLURM usage
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=openlpt_settings
+#SBATCH --cpus-per-task=24
+module load anaconda  # or your python env
+python cli_tracking_settings.py "$PROJECT_DIR" \
+    --frame-start 0 --frame-end 49931 \
+    --bubble-min-radius 4 --bubble-max-radius 60 --bubble-sensitivity 0.8 \
+    --n-threads "$SLURM_CPUS_PER_TASK"
+```
+
+---
+
+## 10. "Generate CLI" button on the Settings page
+
+**Date:** 2026-06-15
+**File:** `gui/views/tracking_settings_view.py`
+
+### What it does
+
+Adds a **"Generate CLI"** button (green, matching the Preprocessing / Wand
+Calibration "Generate CLI" buttons) to the Actions panel, directly below
+**"Save Configuration"**. Pressing it opens a dialog showing the
+`cli_tracking_settings.py` command (see section 9) that reproduces
+**"Save Configuration" with the CURRENT field values** - copy that line into
+a terminal/SLURM script to write `config.txt` +
+`bubbleConfig.txt`/`tracerConfig.txt` headlessly, without opening the GUI.
+
+### How it matches "Save Configuration"
+
+`_build_settings_cli_command()` reads every field `_save_configuration()`
+reads (object type, FPS, camera/frame/thread counts, image/camera/output
+paths, view volume, voxel-to-mm, resume flag/frame, IPR/shake/STB/predictive-
+field parameters, and tracer- or bubble-specific parameters) and maps each one
+to the matching `cli_tracking_settings.py` flag, so the generated command is
+self-contained: it does not rely on `cli_tracking_settings.py`'s own
+auto-detection to reproduce the values currently shown in the UI. The dialog
+notes that flags can be removed if the user wants a value re-derived from
+`imgFile`/`camFile` on the run instead.
+
+### Verified
+
+Headless (`QT_QPA_PLATFORM=offscreen`): for both Bubble and Tracer object
+types, running the generated command produces `config.txt` +
+`bubbleConfig.txt`/`tracerConfig.txt` **byte-identical** to calling
+`_save_configuration()` directly with the same field values.
+
+### Relationship to the bubble-reference-image fix (item... see C++ changes)
+
+No interaction. This CLI only writes `config.txt`/`[type]Config.txt`; the
+bubble reference image is built at tracking runtime (C++ `STB`/`IPR`), after
+these config files are read. Neither this button nor
+`cli_tracking_settings.py` needed any changes for that fix.
+
+---
+
+## 11. "Validate Settings" — bubble-reference-image-aware, responsive, frame-scanning
+
+**Date:** 2026-06-15
+**File:** `gui/views/tracking_settings_view.py`
+
+**Scope note:** this is a Python/GUI-only change to the "Validate Settings"
+button. The tracking binary is **unmodified** - `src/srcSTB/IPR.cpp`,
+`src/srcSTB/STB.cpp`, `inc/libSTB/STB.h`, `src/main.cpp`, and
+`src/pybind_OpenLPT/pySTB.cpp` are at their original upstream state (original
+`THROW_FATAL_CTX` on `calBubbleRefImg` failure, only ever checks
+`frame_start`). "Validate Settings" is a setup-time helper: it scans
+`frame_start..frame_end` for a frame whose 2D detections + 3D matching would
+pass `calBubbleRefImg`'s actual 3 gates (same function, called via the
+existing pybind `BubbleRefImg.calBubbleRefImg` binding), and - if that frame
+needed relaxed IPR 2D/3D tolerances - updates the '2D tolerance'/'3D
+tolerance' widgets so "Save Configuration" writes those into
+`bubbleConfig.txt`. `config.txt`'s Frame Start/Frame End are always exactly
+what the user typed and are never changed by Validate or by this.
+
+### Problems fixed (3 issues from testing)
+
+1. **UI froze / Cancel unresponsive on long scans.** A real dataset can need
+   150+ frames scanned before finding one with enough bubbles, each with up to
+   ~16 tolerance-bump retries - thousands of blocking `StereoMatch().match()`
+   calls with `wasCanceled()` only checked once per frame. The
+   `QProgressDialog(0,0)` busy-bar was also not useful (no determinate
+   progress to show).
+2. **Frame range came from `config.txt`, not the UI.** Validate required
+   `config.txt` to exist (it's the only source of camera params/image paths),
+   but read `frame_start`/`frame_end` from it too - so if the user changed
+   "Frame Start"/"Frame End" in the UI without re-saving, Validate silently
+   scanned the OLD range.
+3. **Pass criterion (`count_3d >= avg_2d_count/4`) didn't match
+   `calBubbleRefImg`'s real gates**, so Validate could report success on a
+   frame where the actual bubble-reference-image build would still fail (3
+   independent fixed-count gates, all requiring >5 qualifying bubbles: every
+   selected 3D bubble must have radius>6px in EVERY camera; an intensity-peak
+   filter (`max_peak > 0.8*mean_peak`); and per-pixel coverage across the
+   reference-image template). A frame with "6 3D objects" can still fail all
+   three.
+
+### Fix
+
+- **New `_ValidationStatusDialog`** (small `QDialog` + `QLabel` + "Stop"
+  button) replaces `QProgressDialog`. `wasCanceled()`/`setLabelText()` have
+  the same call signatures the validation code already used, so the rest of
+  the flow needed minimal changes. `QApplication.processEvents()` is now
+  called and `wasCanceled()` checked at every step inside both the 2D- and
+  3D-tolerance retry loops (not just once per frame), so clicking "Stop" takes
+  effect within a fraction of a second, even mid-frame. A canceled run reports
+  "Validation stopped at frame N (scanned start..N)" instead of a
+  pass/fail verdict.
+- **Frame range from the UI**: `frame_start`/`frame_end`/object type are read
+  from `self.frame_start_spin`/`self.frame_end_spin`/`self.obj_type_combo`
+  (current UI values), not from `basic_settings._frame_start`/`_frame_end`.
+  `config.txt` is still required (camera models / image paths / object config
+  path come from there), but if its saved Frame Range differs from the UI,
+  a note says so and suggests "Save Configuration".
+- **3-gate `calBubbleRefImg` pass criterion** (Bubble only): after each
+  `StereoMatch().match()` (initial and each tolerance-bump retry), if
+  `count_3d > 5`, `_run_validation_on_frame` calls
+  `lpt.BubbleRefImg().calBubbleRefImg(obj3d_list, obj2d_list, camera_models,
+  image_list, "", 6.0, 5)` (empty `output_folder` -> no files written;
+  `calBubbleRefImg` raises `RuntimeError` on failure, caught and treated as
+  "not yet"). The frame is reported as passed only if this succeeds. Tracer
+  has no reference-image concept, so it keeps the old proportional
+  `count_3d >= avg_2d_count/4` proxy.
+- **Scan stops at the first passing frame**; frames with zero 2D detections in
+  any camera are skipped (per-frame data issue, scan continues). On full
+  exhaustion, reports "check `camFile/cam*.txt`" as before.
+- **Tolerance widgets ARE updated on success, `config.txt` Frame Range is
+  NOT**: if the passing frame needed `tol_2d_px`/`tol_3d_mm` increased beyond
+  the config's current values, `ipr_2d_tol`/`ipr_3d_tol` are set to those
+  values (independently - only the tolerance that actually changed is
+  touched). The success message tells the user to click "Save Configuration"
+  to write these into `bubbleConfig.txt`. `frame_start_spin`/`frame_end_spin`
+  (and therefore `config.txt`'s Frame Range) are never modified by Validate.
+  `config.txt` itself is still not written by Validate.
+
+### "Validate first, Save once" — no config.txt required beforehand
+
+Initially "Validate Settings" required `config.txt` to already exist (it's
+the only source of camera params/image paths for
+`lpt.BasicSetting.readConfig()`), forcing: Save -> Validate (updates
+tolerance widgets) -> Save again. This is backwards from the intended
+workflow (Validate first to find a frame, THEN Save once with that result).
+
+Fixed by extracting `_save_configuration()`'s file-content generation into
+`_render_config_files(project_dir, path_mode)`:
+- `path_mode="relative"` (used by `_save_configuration()`, unchanged output):
+  camFile/imgFile/output paths relative to `project_dir`, as before.
+- `path_mode="absolute"` (new, used only by Validate): the SAME content but
+  with camFile/imgFile/output paths as absolute paths into the real project
+  directory - so a `config.txt` written anywhere can still find the real
+  project's data (`BasicSetting::readConfig` resolves relative paths against
+  the directory `config.txt` lives in, via `_config_root`).
+
+`_validate_settings()` now: renders config.txt + `[type]Config.txt` from
+CURRENT UI values (`path_mode="absolute"`), writes them to a fresh
+`tempfile.mkdtemp()` directory, calls `BasicSetting.readConfig()` on the temp
+`config.txt`, runs the frame scan, then `shutil.rmtree()`s the temp directory
+in a `finally` block (even on exceptions). The real project's
+`config.txt`/`bubbleConfig.txt` are **never read or written** by Validate -
+only by "Save Configuration".
+
+### Verified
+
+Headless (`QT_QPA_PLATFORM=offscreen`, mocked `pyopenlpt` incl. `BubbleRefImg`):
+- Frames 0-2 fail (4 matched, `calBubbleRefImg` raises), frame 3 passes at the
+  config's original tolerances: scan stops at frame 3, reports "Validated
+  Frame: 3", `ipr_2d_tol`/`ipr_3d_tol` unchanged, `config.txt` mtime unchanged.
+- Same, but frame 3 only passes after `tol_2d_px` is bumped from 2.0px to
+  3.5px: `ipr_2d_tol` is updated to 3.5, `ipr_3d_tol` stays at its original
+  value (only the tolerance that actually changed is touched).
+- All frames in `[0,3]` fail: reports the "needs >5 well-resolved bubbles ...
+  check calibration" message after scanning the full range.
+- Clicking "Stop" mid-frame (during the first frame's retry ladder) reports
+  "Validation stopped at frame 0 (scanned 0..0)" almost immediately.
+- **No `config.txt` exists at all** (fresh project, never saved): "Validate
+  Settings" with Frame Start=1000/Frame End=10000 runs successfully (frame
+  1000 itself passes after a 2D tolerance bump to 3.5px), updates
+  `ipr_2d_tol`, and leaves no `config.txt`/`bubbleConfig.txt`/temp directories
+  behind. Clicking "Save Configuration" afterward writes `config.txt` with
+  `1000,10000` and `bubbleConfig.txt` with `2D tolerance [px] = 3.5`.
+- Same, but the passing frame is 1003 (not `frame_start`=1000): scan reports
+  "Validated Frame: 1003" with the frame_start-unchanged note, updates
+  `ipr_2d_tol` to 3.5; "Save Configuration" still writes `config.txt`'s Frame
+  Range as `1000,10000`.
+- `_render_config_files(..., path_mode="relative")` output (used by "Save
+  Configuration") is unchanged in format from before this refactor.
+
+
+---
+
+## 12. Block-based coarse-to-fine search for a valid bubble reference frame
+
+**Date:** 2026-06-15
+**Files:**
+- `modules/image_preprocessing/reference_frame.py` (new)
+- `modules/image_preprocessing/cli.py` (`find_reference_frame_from_detected`)
+- `tests/test_reference_frame_search.py` (new)
+
+### Problem
+
+A bubble *reference frame* must (a) contain enough bubbles and (b) pass the
+*existing* validation algorithm (e.g. the `calBubbleRefImg` 3-gate check used by
+"Validate Settings", Change 11). The naive search validates frames 0, 1, 2, …
+until one passes, and that validator is **expensive** (per-camera 2D detection +
+cross-camera stereo matching + the reference-image gates). On real datasets a
+valid frame can be 100+ frames in, so the naive scan runs the expensive validator
+hundreds of times.
+
+**The validation algorithm is not changed** — it is injected as a callable
+(`is_valid(frame_index) -> bool`) and only ever *confirms* a candidate.
+
+### Algorithm (coarse-to-fine, exploits temporal clustering of bubbles)
+
+`find_reference_frame(n, *, is_valid, cheap_count, stride, tau, …)`:
+
+- **L0 coarse probe** — sample frames at a coarse `stride` with a CHEAP proxy
+  (`cheap_count`, a *sound necessary-condition* bubble count = min across cameras
+  of the 2D blob count). `O(N/stride)` cheap reads.
+- **L1 adaptive refine** — around each promising probe (proxy `>= tau`), densify
+  the cheap proxy over the block (`±(stride-1)`) to find the bubble-richest frame
+  and catch a window straddling a probe.
+- **L2 confirm** — run the EXPENSIVE `is_valid` on candidates **best-first** and
+  return the first that passes. ~`O(1)` validations in the common clustered case.
+- **fallback** — a dense (stride-1) cheap pass validates every `>= tau` frame
+  best-first, guaranteeing completeness over the above-threshold set.
+
+If no `cheap_count` is supplied it degrades to jump-search + full-scan fallback
+(early-exit win only).
+
+### Complexity
+
+- **Naive:** up to `N` *expensive* validations.
+- **This:** `O(N/stride)` cheap reads + `O(block)` refine, and **~`O(1)`
+  expensive validations** when valid frames cluster (worst case: number of frames
+  above `tau`). With no proxy and `stride = √N` it is classic jump search
+  (`O(√N)` probes) over contiguous validity.
+
+### Correctness
+
+- **Soundness is free:** a frame is returned only after `is_valid` confirms it —
+  blocks/proxy only change which frames are tried and in what order.
+- **Completeness** needs (i) the proxy to be a sound necessary condition
+  (`is_valid(r)` ⟹ `cheap_count(r) >= tau`; tune the proxy so it never
+  *under*-counts bubbles on a valid frame), and (ii) coverage of the valid window.
+
+### Avoiding missed very short bubble windows
+
+A probe `stride` only **guarantees** catching bubble windows *longer than*
+`stride`; a window of length `<= stride` can fall between probes. Mitigations,
+in order of preference:
+
+1. **Set `stride <= shortest window you must catch`** — derive it from bubble
+   persistence × fps (the conceptual block size is `2*stride-1`).
+2. **Mandatory expand-on-hit refine (L1)** rescues windows straddling a probe and
+   finds the richest frame.
+3. **Dense cheap fallback** (default on): if the coarse/refine phase finds
+   nothing, a stride-1 cheap pass guarantees no above-`tau` window is missed —
+   `O(N)` *cheap* reads but the *expensive* validations stay minimal.
+4. If single-frame windows must be caught and the minimum persistence is unknown,
+   you cannot beat `O(N)` *cheap* reads in the worst case (a length-1 window can
+   hide anywhere) — but you can still keep the *expensive* validations sub-linear,
+   which is the real cost. `exhaustive_fallback=False` trades that completeness
+   for strictly sub-linear behavior.
+
+### Integration
+
+`find_reference_frame_from_detected(detected, is_valid, *, frames=None,
+stride=10, tau=6.0, …)` in `cli.py` builds per-camera frame readers
+(`build_frame_readers`, TIFF or CINE, index-aligned) and the default cheap proxy
+(`make_bubble_count_proxy`: threshold → `connectedComponentsWithStats` → count in
+an area range → min across cameras), then runs the core search over the frames
+`_build_tasks_from_input_root` enumerates. The caller supplies its own
+`is_valid` (e.g. wrapping `calBubbleRefImg`).
+
+### Verification
+
+- `tests/test_reference_frame_search.py` (pure-Python, synthetic
+  `cheap_count`/`is_valid`) — 6/6 pass: finds a valid frame with `<= 5`
+  validations where naive needs ~600; returns `None` (0 validations) when none
+  valid; short windows caught when `stride <= window`; a 1-frame window recovered
+  by the dense fallback (and correctly missed with `exhaustive_fallback=False`,
+  documenting the trade-off); no-proxy jump-search path works.
+- End-to-end (cv2, synthetic 2-camera TIFFs, bubbles only in frames 40–45):
+  `find_reference_frame_from_detected` returns frame 45 with **1** expensive
+  validation and 22 cheap reads of 60 frames, no fallback.
+
+---
+
+## 13. "Error Matrix" popup on the Calibration page (Error Analysis)
+
+**Date:** 2026-06-15
+**File:** `modules/camera_calibration/view.py`
+
+### What it does
+
+Adds an **"Error Matrix"** button to the **Error Analysis** header row (right of
+the "Error Analysis:" label, in `create_wand_tab_v2()`). It opens a dialog with
+two parts:
+
+- **Top — per-camera error stats** (projection error, px): a table with one row
+  per camera plus an **"All cams"** row, columns **Camera, N, Mean, Median,
+  Tail p%, Max**. A **"Tail %"** spin box (default 5%) lets the user set the
+  percentile live — `Tail p%` is the projection error exceeded by the worst `p%`
+  of frames (i.e. the `(100 - p)`th percentile, `np.percentile(vals, 100 - p)`).
+  A line below shows the **wand-length error** summary (mean / median / tail p% /
+  max, in mm), recomputed with the same `p`.
+- **Bottom — the full error matrix**: a sortable, read-only table of
+  `Frame x Cam<N>` projection errors plus `Len Err (mm)`, with cells exceeding
+  the page's proj/len filter thresholds highlighted (same as the inline table).
+
+### How it works
+
+`_show_error_matrix()` reads the existing
+`self.wand_calibrator.calculate_per_frame_errors()` (`{frame: {'cam_errors':
+{cam: px}, 'len_error': mm}}`) — the same source the inline error table uses —
+collects each camera's projection-error distribution, and computes Mean / Median
+/ Tail-percentile / Max with numpy. Changing the Tail % spin box re-fills only the
+stats table (the matrix is unchanged). If no calibration has been run yet, it
+shows an info dialog instead.
+
+### Notes / guarantees
+
+- **No algorithm changes.** It only summarizes/visualizes the already-computed
+  per-frame errors; nothing is recalculated or filtered.
+- Verified headless (`QT_QPA_PLATFORM=offscreen`, synthetic 2-camera per-frame
+  errors): the dialog builds with the per-camera + "All cams" rows, Mean/Median/
+  Tail/Max populate correctly, the matrix has `Frame, Cam 1, Cam 2, Len Err (mm)`
+  columns over all frames, the wand-length summary line renders, and changing
+  Tail % updates the header and recomputes the tail values (10% -> lower, 1% ->
+  higher), as expected for a percentile. `view.py` compiles clean.
