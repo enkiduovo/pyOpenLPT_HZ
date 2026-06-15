@@ -26,7 +26,10 @@ workflow conveniences only.
   `tracerConfig.txt`).
 - `modules/image_preprocessing/reference_frame.py` — **new**: block-based
   coarse-to-fine search for a valid bubble *reference frame* (validation injected,
-  never modified).
+  never modified). Includes `find_reference_frame` (stride),
+  `find_reference_frame_blocks` (hierarchical fps/5 blocks gated by a cheap
+  `count_3d` probe), and `make_stereomatch_count3d_proxy` (single-StereoMatch
+  proxy that does **not** touch the validator).
 - `modules/image_preprocessing/cli.py` — added `find_reference_frame_from_detected`
   (wires the search to the frames `_build_tasks_from_input_root` enumerates).
 - `tests/test_image_preprocessing_cli.py`,
@@ -903,6 +906,36 @@ in a `finally` block (even on exceptions). The real project's
 `config.txt`/`bubbleConfig.txt` are **never read or written** by Validate -
 only by "Save Configuration".
 
+### Block search instead of one-by-one scan (HZ_fix, 2026-06-15)
+
+`_validate_settings`'s frame loop no longer validates `frame_start..frame_end`
+one frame at a time. It now drives a **complete coarse-to-fine** block search
+from `modules/image_preprocessing/reference_frame.py`:
+`find_reference_frame_blocks(..., block_size=fps//5, tau=6)`. It cheap-probes
+frames at progressively finer strides (`fps/5`, `fps/25`, … down to every frame)
+with the **`count_3d` proxy** (`make_stereomatch_count3d_proxy`, a single
+`StereoMatch` at the validator's MAX retry tolerances `tol_2d+5` / `tol_3d+1mm`,
+so a frame is pruned only if NO validation attempt could pass), and runs the
+**unchanged** `_run_validation_on_frame` on the first frame that clears the gate.
+
+**Completeness:** if every block head triangulates nothing, it does **not** fail
+— it shrinks the block and probes the in-between frames, only reporting "no valid
+frame" once **every** frame has been cheap-probed. A valid frame at a coarse
+position is still found fast (early levels); the full sweep happens only when
+failing. Each frame is probed at most once. The expensive validator is still
+gated by `count_3d >= tau` (zero calls when nothing triangulates). Cancellation
+is checked during the cheap probes; tolerance-update + success/failure dialogs
+preserved; when nothing triangulates, one real validation runs on the
+bubble-richest probe for the diagnostic and the failure dialog says all frames
+were checked.
+
+`_run_validation_on_frame` / `calBubbleRefImg` are **not modified** — only the
+scan that drives them. On the real 4-camera / 49,932-frame T1 dataset (camFile
+triangulates nothing) it cheap-probes coarse-to-fine and reports "no valid
+frame -> check calibration" with **0 expensive validations** (the full cheap
+sweep is `O(n)`, same order as the original one-by-one scan but without the
+retry ladder, and Stop-cancellable).
+
 ### Verified
 
 Headless (`QT_QPA_PLATFORM=offscreen`, mocked `pyopenlpt` incl. `BubbleRefImg`):
@@ -1027,6 +1060,43 @@ an area range → min across cameras), then runs the core search over the frames
 - End-to-end (cv2, synthetic 2-camera TIFFs, bubbles only in frames 40–45):
   `find_reference_frame_from_detected` returns frame 45 with **1** expensive
   validation and 22 cheap reads of 60 frames, no fallback.
+- Integration-tested against the **real** `calBubbleRefImg` validator (the GUI's
+  unmodified `_run_validation_on_frame`) on a real 4-camera / 49,932-frame
+  dataset: the search drives the real pipeline end-to-end and, when the dataset's
+  calibration triangulates nothing (0 3D matches on every probed frame), returns
+  `None` after a bounded 120 validations in ~65 s instead of scanning all 49,932
+  frames — i.e. the “no valid frame” path degrades gracefully. (A speed benchmark
+  needs a dataset whose calibration actually triangulates.)
+- Added optional `refine_radius` to decouple the L1 refine cost from the coarse
+  miss-guarantee `stride` (defaults to `stride`).
+- **Complete coarse-to-fine (final design).** `find_reference_frame_blocks` was
+  reworked to a multi-resolution sweep: probe at strides `block_size`,
+  `block_size/subdiv`, … down to `min_block` (default 1 = every frame), each frame
+  probed at most once, validating (gated by `count_3d >= tau`) the first frame
+  that clears the gate. **It does not fail from block heads alone** — if the coarse
+  heads triangulate nothing it shrinks the block and probes the in-between frames,
+  reporting "no valid frame" only after *all* frames are cheap-probed. A valid
+  frame at a coarse position is found fast; the full `O(n)` cheap sweep happens
+  only when failing (same order as the original frame-by-frame scan, minus the
+  retry ladder). The expensive validator stays gated (0 calls when nothing
+  triangulates). `min_block > 1` bounds the sweep to `~n/min_block` cheap probes if
+  a sub-complete scan is wanted. Tests: `count_3d=0` everywhere → probes every
+  frame, 0 validations, then `None`; an interior-only valid frame is found by
+  shrinking; `min_block=block_size` → exactly `n/block_size` probes.
+- **Best design (hierarchical block + `count_3d` gate), benchmarked on real T1**
+  (4 cams, 49,932 frames; `_run_validation_on_frame` reused **unchanged** as the
+  confirm; new `make_stereomatch_count3d_proxy` as the cheap probe):
+  - `find_reference_frame_blocks` with `block_size = fps/5 = 600`, `tau = 6`
+    covered the full range in **84 cheap probes, 0 expensive validations**, 42 s,
+    returning `None` — vs the earlier naive-per-block scan's **250 full
+    validations / 135 s**. The `count_3d` gate means the expensive validator is
+    never wasted (T1 triangulates nothing: `max count_3d = 0`).
+  - Honest caveat: on T1 the cheap probe and the full validation are **both
+    ~521 ms** — T1 is *2D-detection-bound* (`findObject2D` dominates; the match
+    ladder is cheap on 0-match frames), so the ladder-skipping ~10x win only
+    materializes on data that actually triangulates. Multi-threading is the
+    weakest lever here: `findObject2D`/`StereoMatch.match` hold the GIL and the
+    C++ is already internally OpenMP, so Python threads oversubscribe the cores.
 
 ---
 

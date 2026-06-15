@@ -2064,27 +2064,93 @@ class TrackingSettingsView(QWidget):
 
             config_note = ""
 
+            # HZ_fix: instead of validating one-by-one from frame_start (which on a
+            # long clip means thousands of expensive validations before a verdict),
+            # use a block-based coarse-to-fine search. It probes the 1st frame of
+            # each fps/5 block with a CHEAP count_3d proxy (a single StereoMatch at
+            # the validator's MAX retry tolerances, so a frame is only pruned if NO
+            # validation attempt could pass), ranks blocks by that score, and runs
+            # the UNCHANGED _run_validation_on_frame only on frames that clear the
+            # gate (with bounded greedy /5 refine inside a promising block). The
+            # per-frame validator is not modified.
+            from modules.image_preprocessing.reference_frame import (
+                find_reference_frame_blocks,
+                make_stereomatch_count3d_proxy,
+            )
+
+            fps = int(self.fps_spin.value()) if hasattr(self, 'fps_spin') else 1000
+            block_size = max(1, fps // 5)
+            n_search = frame_end - frame_start + 1
+
+            # Sound gate: probe at the validator's loosest retry tolerances.
+            max_tol_2d = obj_cfg._sm_param.tol_2d_px + 5.0
+            max_tol_3d = obj_cfg._sm_param.tol_3d_mm + 1.0
+            _cheap_probe = make_stereomatch_count3d_proxy(
+                lpt, camera_models, obj_cfg, imgio_list, num_cams,
+                tol_2d_px=max_tol_2d, tol_3d_mm=max_tol_3d,
+            )
+
+            class _ValCanceled(Exception):
+                pass
+
+            self._val_last_result = None
+            best_probe = {"count_3d": -1, "frame": frame_start}
+
+            def _cheap_count(idx):
+                fid = frame_start + idx
+                if progress.wasCanceled():
+                    raise _ValCanceled()
+                progress.setLabelText(f"Scanning block (frame {fid})...")
+                QApplication.processEvents()
+                c3 = _cheap_probe(fid)
+                if c3 > best_probe["count_3d"]:
+                    best_probe["count_3d"] = c3
+                    best_probe["frame"] = fid
+                return c3
+
+            def _is_valid(idx):
+                fid = frame_start + idx
+                r = self._run_validation_on_frame(
+                    lpt, camera_models, obj_cfg, imgio_list, fid, progress, num_cams, obj_type
+                )
+                self._val_last_result = r
+                if r.get("canceled"):
+                    raise _ValCanceled()
+                return bool(r.get("passed"))
 
             last_result = None
-            for frame_id in range(frame_start, frame_end + 1):
-                if progress.wasCanceled():
-                    break
-
-                last_result = self._run_validation_on_frame(
-                    lpt, camera_models, obj_cfg, imgio_list, frame_id, progress, num_cams, obj_type
+            try:
+                found_idx, _search_stats = find_reference_frame_blocks(
+                    n_search, is_valid=_is_valid, cheap_count=_cheap_count,
+                    block_size=block_size, tau=6.0, subdiv=5,
                 )
-
-                if last_result["canceled"]:
-                    break
-
-                if last_result["no_2d"]:
-                    # No 2D objects at all is a per-frame data issue (e.g.
-                    # an empty/black frame) - keep scanning forward, same as
-                    # the bubble-reference-image search.
-                    continue
-
-                if last_result["passed"]:
-                    break
+                last_result = self._val_last_result
+                # Nothing triangulated enough to reach the validator: run ONE real
+                # validation on the bubble-richest probe so the failure dialog still
+                # has a meaningful diagnostic (count_3d, per-camera counts, etc.).
+                if last_result is None:
+                    n_probed = _search_stats.cheap_reads
+                    config_note += (
+                        f"\n\n(Block search: coarse-to-fine, started at {block_size}-"
+                        f"frame blocks and shrank until all {n_probed} frames in "
+                        f"{frame_start}..{frame_end} were checked; none triangulated "
+                        f">5 objects even at the loosest tolerances, so no frame could "
+                        f"build a bubble reference image. Frame {best_probe['frame']} "
+                        f"below is a representative diagnostic.)"
+                    )
+                    last_result = self._run_validation_on_frame(
+                        lpt, camera_models, obj_cfg, imgio_list, best_probe["frame"],
+                        progress, num_cams, obj_type
+                    )
+            except _ValCanceled:
+                progress.close()
+                stopped = (self._val_last_result or {}).get("frame_id", best_probe["frame"])
+                QMessageBox.information(
+                    self, "Validation Stopped",
+                    f"Validation stopped near frame {stopped} "
+                    f"(block search over {frame_start}..{frame_end}).{config_note}"
+                )
+                return
 
             progress.close()
 

@@ -78,6 +78,7 @@ def find_reference_frame(
     cheap_count: Optional[Callable[[int], float]] = None,
     stride: int = 1,
     tau: float = 1.0,
+    refine_radius: Optional[int] = None,
     max_validations: Optional[int] = None,
     exhaustive_fallback: bool = True,
 ) -> tuple[Optional[int], ReferenceSearchStats]:
@@ -105,6 +106,11 @@ def find_reference_frame(
     tau:
         Proxy threshold = validation's true minimum bubble count (a *lower* bound,
         so the proxy never wrongly skips a valid frame).
+    refine_radius:
+        Half-width of the L1 refine window around a promising probe. Defaults to
+        ``stride`` (blocks tile). Set smaller to bound refine cost when the cheap
+        proxy is itself expensive (it decouples refine cost from the coarse
+        miss-guarantee ``stride``).
     max_validations:
         Optional cap on expensive validations (returns ``None`` if exhausted).
     exhaustive_fallback:
@@ -121,6 +127,7 @@ def find_reference_frame(
     if n_frames <= 0:
         return None, stats
     s = max(1, int(stride))
+    rad = s if refine_radius is None else max(1, int(refine_radius))
 
     _cheap_cache: dict[int, Optional[float]] = {}
     _valid_cache: dict[int, bool] = {}
@@ -179,7 +186,7 @@ def find_reference_frame(
         stats.probes_considered += 1
         # L1 refine + L2 confirm: validate the richest candidates in this block
         # first, returning on the first frame the real validator accepts.
-        for cand in _refine_block(r, n_frames, s, cheap, tau):
+        for cand in _refine_block(r, n_frames, rad, cheap, tau):
             if cand in tried:
                 continue
             tried.add(cand)
@@ -204,6 +211,97 @@ def find_reference_frame(
                 stats.fallback_used = True
                 return r, stats
 
+    return None, stats
+
+
+def find_reference_frame_blocks(
+    n_frames: int,
+    *,
+    is_valid: Callable[[int], bool],
+    cheap_count: Callable[[int], float],
+    block_size: int,
+    tau: float = 1.0,
+    subdiv: int = 5,
+    min_block: int = 1,
+    max_validations: Optional[int] = None,
+) -> tuple[Optional[int], ReferenceSearchStats]:
+    """Multi-resolution coarse-to-fine block search (complete).
+
+    Probes frames at **progressively finer** strides — ``block_size``, then
+    ``block_size/subdiv``, then ``/subdiv`` again, … down to ``min_block`` (and a
+    final stride of ``min_block``). At each newly-probed frame the cheap proxy
+    runs; if it clears ``tau`` the (unchanged, injected) ``is_valid`` confirms it,
+    returning on the first that passes. Each frame is probed **at most once**
+    (a ``probed`` set dedupes across levels).
+
+    This means: if the coarse block heads all score below ``tau`` (e.g. every
+    block's first frame triangulates nothing), the search does **not** fail — it
+    shrinks the block and probes the in-between frames, and only reports "no valid
+    frame" once **every frame down to ``min_block``** has been cheap-probed
+    (``min_block=1`` ⇒ all frames). A valid frame at a coarse position is still
+    found fast (early levels), so the full sweep only happens when failing.
+
+    Cost: with ``min_block=1`` the cheap proxy is evaluated on every frame in the
+    no-valid case (``O(n)`` cheap probes — same order as the original frame-by-
+    frame scan, but without the expensive retry ladder); the expensive
+    ``is_valid`` is still only ever run on frames whose cheap score ``>= tau``
+    (zero of them when nothing triangulates). Set ``min_block > 1`` to stop
+    shrinking early (``~n/min_block`` cheap probes, sub-complete) if you want a
+    bounded scan.
+
+    ``is_valid`` is **never modified** — only the scan order/gating around it.
+    Pick ``tau`` = the validator's true minimum (so the gate is sound) and
+    ``block_size`` ≈ shortest bubble window (e.g. ``fps/5``).
+
+    Returns ``(frame_index or None, stats)``.
+    """
+    stats = ReferenceSearchStats()
+    if n_frames <= 0:
+        return None, stats
+    bs = max(1, int(block_size))
+    sub = max(2, int(subdiv))
+    mb = max(1, int(min_block))
+
+    _valid_cache: dict[int, bool] = {}
+
+    def valid(r: int) -> bool:
+        if r in _valid_cache:
+            return _valid_cache[r]
+        if max_validations is not None and stats.validations >= max_validations:
+            return False
+        res = bool(is_valid(r))
+        _valid_cache[r] = res
+        stats.validations += 1
+        return res
+
+    # Build the coarse-to-fine stride schedule: bs, bs/sub, bs/sub^2, ..., >= mb,
+    # with a final stride of mb so coverage is complete down to min_block.
+    strides = []
+    s = bs
+    while True:
+        strides.append(s)
+        if s <= mb:
+            break
+        s = max(mb, s // sub)
+        if strides and s == strides[-1]:
+            break
+    if strides[-1] != mb:
+        strides.append(mb)
+
+    probed: set[int] = set()
+    for s in strides:
+        for f in range(0, n_frames, s):
+            if f in probed:
+                continue
+            probed.add(f)
+            sc = float(cheap_count(f))
+            stats.cheap_reads += 1
+            stats.probe_scores[f] = sc
+            if sc >= tau:
+                stats.probes_considered += 1
+                if valid(f):
+                    stats.found_index = f
+                    return f, stats
     return None, stats
 
 
@@ -297,5 +395,55 @@ def make_bubble_count_proxy(
 
     def cheap_count(r: int) -> int:
         return min(_count(rd(r)) for rd in readers)
+
+    return cheap_count
+
+
+def make_stereomatch_count3d_proxy(lpt, camera_models, obj_cfg, imgio_list, num_cams,
+                                   tol_2d_px=None, tol_3d_mm=None):
+    """Build the recommended cheap proxy ``cheap_count(frame) -> int = count_3d``.
+
+    For one frame: load each camera image, run 2D detection, then a **single**
+    ``StereoMatch().match()`` (NO tolerance retry ladder) and return the number of
+    matched 3D objects. This is ~10x cheaper than the full validation (which
+    retries the match ~17x and then runs ``calBubbleRefImg``) yet is the *actual*
+    triangulation signal — far more predictive of validity than a 2D bubble count.
+
+    ``tol_2d_px`` / ``tol_3d_mm`` (optional) set the StereoMatch tolerances for the
+    probe and are **restored** afterwards. Pass the validator's *maximum* retry
+    tolerances here to make the gate **sound**: if even at the loosest tolerance a
+    frame yields ``count_3d <= 5``, no validation attempt could pass, so it is safe
+    to prune without ever calling the expensive validator.
+
+    It reuses the same ``lpt`` primitives the validator uses but is a **separate
+    function**: the original validation routine (``_run_validation_on_frame`` /
+    ``calBubbleRefImg``) is not modified or called here.
+
+    Returns 0 if any camera has no 2D detections (a frame that can't triangulate).
+    """
+    finder = lpt.ObjectFinder2D()
+
+    def cheap_count(frame_id: int) -> int:
+        obj2d_list = []
+        for cam_id in range(num_cams):
+            img = imgio_list[cam_id].loadImg(frame_id)
+            obj2ds = finder.findObject2D(img, obj_cfg)
+            if len(obj2ds) == 0:
+                return 0  # no triangulation possible if a camera sees nothing
+            obj2d_list.append(obj2ds)
+        save2d = obj_cfg._sm_param.tol_2d_px
+        save3d = obj_cfg._sm_param.tol_3d_mm
+        try:
+            if tol_2d_px is not None:
+                obj_cfg._sm_param.tol_2d_px = float(tol_2d_px)
+            if tol_3d_mm is not None:
+                obj_cfg._sm_param.tol_3d_mm = float(tol_3d_mm)
+            obj3d_list = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg).match()
+        except Exception:
+            return 0
+        finally:
+            obj_cfg._sm_param.tol_2d_px = save2d
+            obj_cfg._sm_param.tol_3d_mm = save3d
+        return len(obj3d_list)
 
     return cheap_count
