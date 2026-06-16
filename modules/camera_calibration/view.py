@@ -1322,24 +1322,40 @@ class CameraCalibrationView(QWidget):
         conf_layout.addRow("Sensitivity:", self.sensitivity_slider)
         det_layout.addWidget(conf_group)
         
-        # Root folder loader (HZ_fix): auto-load cam folders from <root>/T0
-        self.btn_load_root_folder = QPushButton("Auto-Load Cameras from Root (T0)")
+        # Camera-folder loader (HZ_fix): auto-load every 'cam<N>' folder inside the
+        # folder the user selects (the one that directly contains cam0, cam1, ...).
+        root_load_row = QHBoxLayout()
+        root_load_row.setContentsMargins(0, 0, 0, 0)
+        root_load_row.setSpacing(6)
+
+        self.btn_load_root_folder = QPushButton("Auto-Load Cameras from Folder")
         self.btn_load_root_folder.setStyleSheet(btn_style)
         self.btn_load_root_folder.setToolTip(
-            "Select a root folder containing a 'T0' subfolder. All 'cam<N>' folders "
-            "inside T0 are loaded in ascending order. Num Cameras is updated to match."
+            "Select the folder that directly contains 'cam<N>' folders (cam0, cam1, "
+            "...). All are loaded in ascending order; Num Cameras is updated to match."
         )
         self.btn_load_root_folder.clicked.connect(self._load_wand_root_folder)
-        det_layout.addWidget(self.btn_load_root_folder)
+        root_load_row.addWidget(self.btn_load_root_folder, 1)
 
-        # Info / status line shown below the button.
+        # Square info button: pops up the help / last-load status text.
+        self.btn_root_folder_info = QPushButton("ⓘ")
+        self.btn_root_folder_info.setStyleSheet(btn_style)
+        self.btn_root_folder_info.setFixedWidth(40)
+        self.btn_root_folder_info.setToolTip("Show info / last load status")
+        self.btn_root_folder_info.clicked.connect(self._show_root_folder_info)
+        root_load_row.addWidget(self.btn_root_folder_info, 0)
+
+        det_layout.addLayout(root_load_row)
+
+        # Help / status text — not shown inline; revealed via the ⓘ info button
+        # (and updated in place after a load so the popup reflects the last result).
         self.root_folder_info = QLabel(
-            "Pick a root folder that contains a 'T0' subfolder with 'cam0', "
-            "'cam1', … folders. Num Cameras updates automatically."
+            "Pick the folder that directly contains the cam0, cam1, …, cam<N> folders.\n"
+            "Num Cameras updates automatically.\n"
+            "Alternatively, you can load each camera folder individually by clicking the Load button below."
         )
         self.root_folder_info.setWordWrap(True)
-        self.root_folder_info.setStyleSheet("color: #8a98a8; font-size: 11px;")
-        det_layout.addWidget(self.root_folder_info)
+        self.root_folder_info.setVisible(False)
 
         # Table (with per-camera focal length and image size)
         det_layout.addWidget(QLabel("Camera Images:"))
@@ -1432,7 +1448,7 @@ class CameraCalibrationView(QWidget):
         # HZ_fix: Output Path section (above the action buttons). "Process All
         # Frames" saves/resumes the detection CSV here instead of prompting for a
         # path each run (and prompting again at the end).
-        output_group = QGroupBox("Output Path")
+        output_group = QGroupBox("Output Path for wand_points.csv")
         output_layout = QVBoxLayout(output_group)
         output_row = QHBoxLayout()
         self.wand_output_path_edit = QLineEdit()
@@ -1558,18 +1574,33 @@ class CameraCalibrationView(QWidget):
         cal_layout.setSpacing(15)
         cal_layout.setContentsMargins(10, 10, 10, 10)
 
-        # --- Import Config (HZ_fix): load all Cal-page settings (top of tab) ---
-        # Export Config lives lower down, just above "Load Wand Points (from CSV)".
-        config_group = QGroupBox("Config Load")
-        config_layout = QVBoxLayout(config_group)
+        # --- Config Load/Export (HZ_fix): import & export all Cal-page settings,
+        # both at the top of the tab, in their own (distinct purple) colour. ---
+        config_group = QGroupBox("Config Load/Export")
+        config_layout = QHBoxLayout(config_group)
+        config_btn_style = (
+            "QPushButton { background-color:#4a3f6b; color:white; "
+            "border:1px solid #6a5a9a; border-radius:4px; padding:8px; "
+            "font-size:13px; min-height:25px; }"
+            "QPushButton:hover { background-color:#5d4f86; }"
+        )
         self.btn_import_cal_config = QPushButton("Import Config")
-        self.btn_import_cal_config.setStyleSheet(btn_style)
+        self.btn_import_cal_config.setStyleSheet(config_btn_style)
         self.btn_import_cal_config.setToolTip(
             "Load all Calibration-page settings (camera model, wand length, "
             "distortion, refraction, filters) from a JSON config file."
         )
         self.btn_import_cal_config.clicked.connect(self._import_cal_config)
+
+        self.btn_export_cal_config = QPushButton("Export Config")
+        self.btn_export_cal_config.setStyleSheet(config_btn_style)
+        self.btn_export_cal_config.setToolTip(
+            "Save all current Calibration-page settings to a JSON config file."
+        )
+        self.btn_export_cal_config.clicked.connect(self._export_cal_config)
+
         config_layout.addWidget(self.btn_import_cal_config)
+        config_layout.addWidget(self.btn_export_cal_config)
         cal_layout.addWidget(config_group)
 
         cal_group = QGroupBox("Calibration Settings")
@@ -1713,16 +1744,6 @@ class CameraCalibrationView(QWidget):
         self._update_refraction_cam_table(4)
         
         cal_layout.addStretch()
-
-        # Export Config (HZ_fix): moved here from the top Config Load section so it
-        # sits directly above "Load Wand Points (from CSV)".
-        self.btn_export_cal_config = QPushButton("Export Config")
-        self.btn_export_cal_config.setStyleSheet(btn_style)
-        self.btn_export_cal_config.setToolTip(
-            "Save all current Calibration-page settings to a JSON config file."
-        )
-        self.btn_export_cal_config.clicked.connect(self._export_cal_config)
-        cal_layout.addWidget(self.btn_export_cal_config)
 
         # Load Points Button
         self.btn_load_points = QPushButton("Load Wand Points (from CSV)")
@@ -4180,8 +4201,85 @@ class CameraCalibrationView(QWidget):
                 folders[cam_idx] = str(Path(files[0]).parent)
         return folders
 
+    def _show_generate_cli_dialog(self, command, default_save_path, subtitle=""):
+        """HZ_fix: Popup showing a generated CLI command with Save / Copy / Close.
+
+        Does NOT write any file automatically — the user chooses Save (asks where),
+        Copy CLI (to clipboard), or Close.
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit,
+            QPushButton, QApplication,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Generate CLI")
+        dlg.setMinimumWidth(660)
+        layout = QVBoxLayout(dlg)
+
+        if subtitle:
+            lbl = QLabel(subtitle)
+            lbl.setWordWrap(True)
+            layout.addWidget(lbl)
+
+        text = QPlainTextEdit()
+        text.setPlainText(command)
+        text.setReadOnly(True)
+        text.setMinimumHeight(150)
+        text.setStyleSheet(
+            "QPlainTextEdit { background:#0d1117; color:#7ee787; "
+            "font-family: Menlo, Consolas, monospace; font-size: 12px; "
+            "border:1px solid #333; padding:6px; }"
+        )
+        layout.addWidget(text, 1)
+
+        btn_style = ("QPushButton { background:#2a3f5f; color:white; padding:6px 18px; "
+                     "border:1px solid #444; border-radius:4px; }"
+                     "QPushButton:hover { background:#3b5278; }")
+        btn_save = QPushButton("Save")
+        btn_copy = QPushButton("Copy CLI")
+        btn_close = QPushButton("Close")
+        for b in (btn_save, btn_copy, btn_close):
+            b.setStyleSheet(btn_style)
+
+        row = QHBoxLayout()
+        row.addWidget(btn_save)      # bottom-left
+        row.addStretch()
+        row.addWidget(btn_copy)      # middle
+        row.addStretch()
+        row.addWidget(btn_close)     # bottom-right
+        layout.addLayout(row)
+
+        def do_save():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, "Save CLI Command", str(default_save_path),
+                "Text Files (*.txt);;All Files (*)"
+            )
+            if not path:
+                return
+            try:
+                with open(path, 'w') as f:
+                    f.write(command + "\n")
+            except OSError as e:
+                QMessageBox.critical(dlg, "Save", f"Failed to write:\n{e}")
+                return
+            self.status_label.setText(f"Saved CLI command to {path}")
+            QMessageBox.information(dlg, "Saved", f"Saved to:\n{path}")
+
+        def do_copy():
+            QApplication.clipboard().setText(command)
+            self.status_label.setText("CLI command copied to clipboard")
+            btn_copy.setText("Copied!")
+
+        btn_save.clicked.connect(do_save)
+        btn_copy.clicked.connect(do_copy)
+        btn_close.clicked.connect(dlg.accept)
+
+        self._generate_cli_dialog = dlg  # keep a reference
+        dlg.exec()
+
     def _generate_point_detection_cli(self, checked=False):
-        """HZ_fix: Write a one-line terminal command into T0/Point_Detection_CLI.txt.
+        """HZ_fix: Show the one-line "Process All Frames" command (Save/Copy/Close).
 
         Copy that line into a terminal and it runs exactly what the
         "Process All Frames / Resume" button does — the same detection over all
@@ -4194,7 +4292,7 @@ class CameraCalibrationView(QWidget):
         if not cam_folders:
             QMessageBox.warning(
                 self, "Generate CLI",
-                "Load camera images first (use 'Auto-Load Cameras from Root (T0)' "
+                "Load camera images first (use 'Auto-Load Cameras from Folder' "
                 "or the per-camera Load buttons)."
             )
             return
@@ -4219,28 +4317,23 @@ class CameraCalibrationView(QWidget):
             str(t0_dir), wand_type, min_r, max_r, sensitivity,
             detect_mode, str(out_csv),
         )
-        try:
-            with open(cli_txt_path, 'w') as f:
-                f.write(command + "\n")
-        except OSError as e:
-            QMessageBox.critical(self, "Generate CLI", f"Failed to write CLI file:\n{e}")
-            return
-
-        self.status_label.setText(f"Wrote CLI command to {cli_txt_path}")
-        QMessageBox.information(
-            self, "Generate CLI",
-            f"One-line command written to:\n{cli_txt_path}\n\n"
-            f"Copy it into a terminal to run 'Process All Frames' headless "
-            f"(writes {out_csv.name}):\n\n{command}"
+        self._show_generate_cli_dialog(
+            command,
+            default_save_path=cli_txt_path,
+            subtitle=(
+                "One-line command that runs 'Process All Frames' headless "
+                f"(writes {out_csv.name}). Save it, copy it into a terminal, or close."
+            ),
         )
 
     def _generate_calibration_cli(self, checked=False):
-        """HZ_fix: Write a one-line terminal command that runs 'Run Calibration'.
+        """HZ_fix: Show the one-line "Run Calibration" command (Save/Copy/Close).
 
-        Prompts for the wand-points CSV (output of the detection step), reads the
+        Uses the wand-points CSV (output of the detection step), the
         Calibration-page settings and the per-camera focal/image-size from the
-        detection table, and writes Calibration_CLI.txt (one line) next to the CSV.
-        Copy that line into a terminal to calibrate headless.
+        detection table. Nothing is written automatically — the user Saves (chooses
+        where), Copies the command, or Closes. Copy it into a terminal to
+        calibrate headless.
         """
         from pathlib import Path
         from .wand_calibration.wand_calibration_cli import build_cli_command
@@ -4304,19 +4397,14 @@ class CameraCalibrationView(QWidget):
             num_windows=num_windows, cam_to_window=cam_to_window,
             window_media=window_media,
         )
-        try:
-            with open(cli_txt_path, 'w') as f:
-                f.write(command + "\n")
-        except OSError as e:
-            QMessageBox.critical(self, "Generate CLI", f"Failed to write CLI file:\n{e}")
-            return
-
-        self.status_label.setText(f"Wrote calibration CLI command to {cli_txt_path}")
-        QMessageBox.information(
-            self, "Generate CLI",
-            f"One-line command written to:\n{cli_txt_path}\n\n"
-            f"Copy it into a terminal to run 'Run Calibration' headless "
-            f"(writes camFile/cam<N>.txt in {output_dir.name}):\n\n{command}"
+        self._show_generate_cli_dialog(
+            command,
+            default_save_path=cli_txt_path,
+            subtitle=(
+                "One-line command that runs 'Run Calibration' headless "
+                f"(writes camFile/cam<N>.txt in {output_dir.name}). "
+                "Save it, copy it into a terminal, or close."
+            ),
         )
 
     # ------------------------------------------------------------------ #
@@ -4453,8 +4541,8 @@ class CameraCalibrationView(QWidget):
         QMessageBox.information(self, "Import Config", f"Config loaded from:\n{path}")
 
     def _load_wand_root_folder(self, checked=False):
-        """HZ_fix: Select a root folder, find its 'T0' subfolder, and auto-load every
-        'cam<N>' folder inside T0 (ascending by N) into the camera image slots.
+        """HZ_fix: Select the folder that directly contains the 'cam<N>' folders and
+        auto-load every 'cam<N>' (ascending by N) into the camera image slots.
 
         If the number of cam folders found differs from the current Num Cameras
         value, the spinbox is updated to match (e.g. >4 cameras are supported).
@@ -4464,31 +4552,19 @@ class CameraCalibrationView(QWidget):
         import re
         from pathlib import Path
 
-        root = QFileDialog.getExistingDirectory(self, "Select Root Folder (containing T0)")
-        if not root:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Folder Containing cam<N> Folders"
+        )
+        if not folder:
             return
 
-        root_path = Path(root)
+        sel_dir = Path(folder)
 
-        # Locate the T0 folder (case-insensitive) inside the root folder.
-        t0_dir = None
-        for child in sorted(root_path.iterdir()):
-            if child.is_dir() and child.name.lower() == "t0":
-                t0_dir = child
-                break
-
-        if t0_dir is None:
-            self._set_root_folder_info(f"No 'T0' subfolder found in: {root_path.name}", error=True)
-            QMessageBox.warning(
-                self, "Root Folder",
-                f"No 'T0' subfolder found in:\n{root_path}"
-            )
-            return
-
-        # Find cam folders named 'cam<number>' (e.g. cam0, cam1, ...), ascending by number.
+        # Find cam folders named 'cam<number>' (cam0, cam1, ...) directly inside the
+        # selected folder, ascending by number.
         cam_pattern = re.compile(r"^cam(\d+)$", re.IGNORECASE)
         cam_dirs = []
-        for child in t0_dir.iterdir():
+        for child in sel_dir.iterdir():
             if not child.is_dir():
                 continue
             m = cam_pattern.match(child.name)
@@ -4496,60 +4572,50 @@ class CameraCalibrationView(QWidget):
                 cam_dirs.append((int(m.group(1)), child))
 
         if not cam_dirs:
-            self._set_root_folder_info("No 'cam<N>' folders found inside T0.", error=True)
+            self._set_root_folder_info(
+                f"No 'cam<N>' folders found in: {sel_dir.name}", error=True
+            )
             QMessageBox.warning(
-                self, "Root Folder",
-                f"No 'cam<N>' folders found in:\n{t0_dir}"
+                self, "Camera Folders",
+                f"No 'cam<N>' folders found directly inside:\n{sel_dir}"
             )
             return
 
         cam_dirs.sort(key=lambda x: x[0])
         num_found = len(cam_dirs)
 
-        # HZ_fix: gather the image list for every cam folder and VALIDATE before
-        # mutating any UI state. The load is rejected (nothing changes) if a cam
-        # folder is empty or if the frame counts differ between cameras.
+        # HZ_fix: gather the image list for every cam folder. The load PROCEEDS
+        # even when the per-camera frame counts differ — a warning is shown but the
+        # cameras are still loaded. Only a total absence of images aborts.
         image_exts = ['.png', '.jpg', '.bmp', '.tif', '.jpeg']
         cam_files = []
-        empty_cams = []
         for n, cam_dir in cam_dirs:
             files = sorted(
                 str(f) for f in cam_dir.iterdir()
                 if f.is_file() and f.suffix.lower() in image_exts
             )
             cam_files.append(files)
-            if not files:
-                empty_cams.append(f"cam{n}")
-
-        if empty_cams:
-            self._set_root_folder_info(
-                f"No images in: {', '.join(empty_cams)}. Nothing loaded.", error=True
-            )
-            QMessageBox.warning(
-                self, "Root Folder",
-                "These camera folder(s) contain no images:\n"
-                f"{', '.join(empty_cams)}\n\nNothing was loaded."
-            )
-            return
 
         counts = {f"cam{n}": len(files) for (n, _), files in zip(cam_dirs, cam_files)}
-        if len(set(counts.values())) > 1:
-            detail = ", ".join(f"{name}={c}" for name, c in counts.items())
+
+        if all(c == 0 for c in counts.values()):
             self._set_root_folder_info(
-                f"Frame count mismatch ({detail}). Nothing loaded.", error=True
+                "No images found in any cam folder. Nothing loaded.", error=True
             )
             QMessageBox.warning(
-                self, "Root Folder",
-                "The number of images differs between camera folders:\n"
-                f"{detail}\n\nAll cameras must have the same number of frames. "
+                self, "Camera Folders",
+                f"No images found in any 'cam<N>' folder inside:\n{sel_dir}\n\n"
                 "Nothing was loaded."
             )
             return
 
-        # Validation passed. Remember the root / T0 location for later tooling
-        # (e.g. Generate CLI).
-        self.wand_root_dir = str(root_path)
-        self.wand_t0_dir = str(t0_dir)
+        detail = ", ".join(f"{name}={c}" for name, c in counts.items())
+        mismatch = len(set(counts.values())) > 1
+
+        # Remember the cam-folder location for later tooling (e.g. Generate CLI
+        # uses wand_t0_dir as the folder containing cam<N>).
+        self.wand_root_dir = str(sel_dir.parent)
+        self.wand_t0_dir = str(sel_dir)
 
         # Update Num Cameras to match the number of cam folders found. Setting the
         # value (when changed) triggers _update_wand_table, which rebuilds the rows
@@ -4560,30 +4626,39 @@ class CameraCalibrationView(QWidget):
             # Same count: still rebuild so stale image lists are cleared.
             self._update_wand_table(num_found)
 
-        loaded = 0
         for cam_idx, files in enumerate(cam_files):
             self.wand_images[cam_idx] = files
             btn = self.wand_cam_table.cellWidget(cam_idx, 0)
             if btn:
                 btn.setText(f"{len(files)}")
-
             self._update_wand_cam_size_from_first_image(cam_idx, files)
-            loaded += 1
 
         self._refresh_wand_radius_range_limit()
         self.populate_wand_table()
 
         cam_labels = ", ".join(f"cam{n}" for n, _ in cam_dirs)
-        self._set_root_folder_info(
-            f"Loaded {loaded}/{num_found} cameras ({cam_labels}) from "
-            f"{root_path.name}/{t0_dir.name}. Num Cameras = {num_found}.",
-            error=(loaded < num_found),
-        )
-        QMessageBox.information(
-            self, "Root Folder",
-            f"Loaded {loaded}/{num_found} camera folder(s) from:\n{t0_dir}\n"
-            f"({next(iter(counts.values()))} frames per camera)"
-        )
+        if mismatch:
+            self._set_root_folder_info(
+                f"Loaded {num_found} cameras from {sel_dir.name}, but frame counts "
+                f"DIFFER ({detail}).", error=True
+            )
+            QMessageBox.warning(
+                self, "Camera Folders",
+                f"Loaded {num_found} camera folder(s) from:\n{sel_dir}\n\n"
+                f"Warning: the cameras have DIFFERENT numbers of images:\n{detail}\n\n"
+                "They were loaded anyway, but per-frame correspondence may be wrong — "
+                "make sure the frames are synchronized before detecting / calibrating."
+            )
+        else:
+            self._set_root_folder_info(
+                f"Loaded {num_found} cameras ({cam_labels}) from {sel_dir.name}. "
+                f"Num Cameras = {num_found}.", error=False
+            )
+            QMessageBox.information(
+                self, "Camera Folders",
+                f"Loaded {num_found} camera folder(s) from:\n{sel_dir}\n"
+                f"({next(iter(counts.values()))} frames per camera)"
+            )
 
     def _set_root_folder_info(self, text, error=False):
         """HZ_fix: update the status line shown below the Root folder button."""
@@ -4592,6 +4667,12 @@ class CameraCalibrationView(QWidget):
         color = "#e06c6c" if error else "#6cc06c"
         self.root_folder_info.setStyleSheet(f"color: {color}; font-size: 11px;")
         self.root_folder_info.setText(text)
+
+    def _show_root_folder_info(self, checked=False):
+        """HZ_fix: Popup with the Auto-Load help / last-load status text."""
+        QMessageBox.information(
+            self, "Auto-Load Cameras", self.root_folder_info.text()
+        )
 
     def _load_wand_folder_for_cam(self, cam_idx):
         folder = QFileDialog.getExistingDirectory(self, f"Select Image Folder for Camera {cam_idx+1}")
